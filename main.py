@@ -37,6 +37,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Глобальная переменная для хранения пути к копии Python
+_PYTHON_COPY_PATH = None
+
+
+def generate_random_name(length: int = 8) -> str:
+    """Сгенерировать случайное имя для процесса"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
+def get_random_python_path() -> str:
+    """Получить путь к копии python.exe со случайным именем"""
+    global _PYTHON_COPY_PATH
+    
+    if _PYTHON_COPY_PATH and os.path.exists(_PYTHON_COPY_PATH):
+        return _PYTHON_COPY_PATH
+    
+    # Создаём временную папку для копии
+    temp_dir = tempfile.mkdtemp(prefix='PH_')
+    python_exe = sys.executable
+    random_name = generate_random_name(12) + '.exe'
+    python_copy = os.path.join(temp_dir, random_name)
+    
+    try:
+        shutil.copy2(python_exe, python_copy)
+        _PYTHON_COPY_PATH = python_copy
+        logger.debug(f"Создана копия Python: {python_copy}")
+    except Exception as e:
+        logger.error(f"Не удалось создать копию Python: {e}")
+        return sys.executable
+    
+    return python_copy
+
 
 def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.CompletedProcess:
     """Выполнить команду без показа окна консоли"""
@@ -48,25 +81,75 @@ def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.Com
         cmd,
         shell=True,
         capture_output=capture_output,
-        text=True,
         startupinfo=startupinfo,
         creationflags=CREATE_NO_WINDOW
     )
 
 
-def run_hidden_powershell(ps_command: str, capture_output: bool = True) -> subprocess.CompletedProcess:
-    """Выполнить PowerShell команду без показа окна"""
+def run_hidden_powershell(ps_command: str, capture_output: bool = True, random_name: bool = True) -> subprocess.CompletedProcess:
+    """
+    Выполнить PowerShell команду без показа окна
+    
+    Args:
+        ps_command: Команда PowerShell для выполнения
+        capture_output: Захватывать ли вывод
+        random_name: Запускать ли с случайным именем процесса
+    """
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
+    
+    if random_name:
+        # Создаём копию powershell.exe со случайным именем
+        temp_dir = tempfile.mkdtemp(prefix='PS_')
+        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+        random_name = generate_random_name(12) + '.exe'
+        ps_copy = os.path.join(temp_dir, random_name)
+        
+        try:
+            shutil.copy2(ps_exe, ps_copy)
+            logger.debug(f"Создана копия PowerShell: {ps_copy}")
+        except Exception as e:
+            logger.error(f"Не удалось создать копию PowerShell: {e}")
+            ps_copy = ps_exe
+        
+        return subprocess.run(
+            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
+    else:
+        return subprocess.run(
+            ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
 
-    return subprocess.run(
-        ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-        capture_output=capture_output,
-        text=True,
-        startupinfo=startupinfo,
-        creationflags=CREATE_NO_WINDOW
-    )
+
+def decode_output(stdout_bytes: bytes) -> str:
+    """
+    Декодировать вывод команды с обработкой ошибок кодировки
+    
+    Args:
+        stdout_bytes: Байты вывода команды
+        
+    Returns:
+        str: Декодированная строка
+    """
+    if not stdout_bytes:
+        return ""
+    
+    # Пробуем UTF-8, затем cp1251 (кириллица Windows), затем с заменой ошибок
+    for encoding in ['utf-8', 'cp1251', 'cp866']:
+        try:
+            return stdout_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    
+    # Если ничего не подошло, декодируем с заменой некорректных символов
+    return stdout_bytes.decode('utf-8', errors='replace')
 
 
 # Добавляем путь к модулям
@@ -78,6 +161,7 @@ from modules.system import SystemCommands
 from modules.recovery import WinREManager
 from modules.processes import ProcessManager
 from modules.registry import RegistryEditor
+from modules.antigdi import AntiGDIManager, get_suspended_processes
 
 
 # Критические процессы
@@ -179,7 +263,7 @@ class DedHelperApp:
 
         # === Создаём status_var СРАЗУ ===
         self.status_var = tk.StringVar()
-        admin_status = "✓ Администратор" if self.is_admin else "⚠ Нет прав админа!"
+        admin_status = "Администратор" if self.is_admin else "Нет прав админа!"
         self.status_var.set(admin_status)
 
         # Создаём интерфейс
@@ -187,6 +271,9 @@ class DedHelperApp:
         self._create_main_screen()
         self._create_notebook()
         self._create_status_bar()
+
+        # Автоматическое определение диска Windows (для WinPE)
+        self.root.after(1000, self._auto_detect_winpe_drive)
 
         # Обработчик закрытия окна
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
@@ -370,7 +457,6 @@ class DedHelperApp:
             ("Снять ограничения", self._remove_all_restrictions),
             ("Очистить автозагрузку", self._clean_autorun),
             ("sfc /scannow", self._run_sfc),
-            ("Выкл. тестовый режим", self._disable_test_mode),
             ("Восстановить ассоциации", self._restore_associations),
         ]
         
@@ -444,7 +530,7 @@ class DedHelperApp:
         # Версия справа
         version_label = tk.Label(
             status_bar,
-            text="DedHelper v5.0",
+            text="DedHelper",
             font=('Segoe UI', 9),
             bg=COLORS['bg_light'],
             fg=COLORS['text_sec'],
@@ -481,10 +567,10 @@ class DedHelperApp:
         # Для опытного пользователя - без подтверждения
         result = self.restrictions_manager.remove_all_restrictions()
         msg = f"Результат снятия ограничений:\n\n"
-        msg += f"ScancodeMap: {'✅ OK' if result['scancode_map'] else '❌ FAIL'}\n"
+        msg += f"ScancodeMap: {'OK' if result['scancode_map'] else 'FAIL'}\n"
         msg += f"Debuggers: {result['debuggers']} удалено\n"
-        msg += f"DisallowRun: {'✅ OK' if result['disallow_run'] else '❌ FAIL'}\n"
-        msg += f"Hosts: {'✅ OK' if result['hosts'] else '❌ FAIL'}\n"
+        msg += f"DisallowRun: {'OK' if result['disallow_run'] else 'FAIL'}\n"
+        msg += f"Hosts: {'OK' if result['hosts'] else 'FAIL'}\n"
         msg += f"Group Policy: {result['group_policy']} политик удалено"
         messagebox.showinfo("Результат", msg)
     
@@ -516,16 +602,6 @@ class DedHelperApp:
     def _restore_associations(self):
         """Восстановить ассоциации файлов с предварительным бэкапом реестра"""
         # Для опытного пользователя - без подтверждения
-        # Создаём бэкап реестра перед изменением
-        backup_path = os.path.join(os.environ.get('TEMP', '.'), f'associations_backup_{random.randint(1000, 9999)}.reg')
-        try:
-            logger.info(f"Создание бэкапа ассоциаций: {backup_path}")
-            self.registry_editor.export_key('HKCR\\.exe', backup_path)
-            self.registry_editor.export_key('HKCR\\exefile', backup_path)
-            logger.info(f"Бэкап реестра создан: {backup_path}")
-        except Exception as e:
-            logger.warning(f"Не удалось создать бэкап реестра: {e}")
-
         restored = 0
         if self._fix_exe_association(): restored += 1
         if self._fix_bat_association(): restored += 1
@@ -534,7 +610,7 @@ class DedHelperApp:
         if self._fix_html_association(): restored += 1
         
         logger.info(f"Восстановлено {restored} ассоциаций файлов")
-        messagebox.showinfo("Успех", f"Восстановлено ассоциаций: {restored}\nБэкап: {backup_path}")
+        messagebox.showinfo("Успех", f"Восстановлено ассоциаций: {restored}")
     
     def _fix_exe_association(self) -> bool:
         """Восстановить ассоциацию .exe файлов"""
@@ -842,10 +918,17 @@ class DedHelperApp:
             ForEach-Object { if ($_.ExecutablePath) { Write-Output "$($_.ProcessId)=$($_.ExecutablePath)" } }
             '''
             result = run_hidden_powershell(ps_command)
-            for line in result.stdout.strip().split('\n'):
+            
+            # Декодируем вывод с обработкой ошибок кодировки
+            stdout = decode_output(result.stdout) if result.stdout else ""
+            
+            for line in stdout.strip().split('\n'):
                 if '=' in line:
                     pid_str, path = line.split('=', 1)
-                    paths[int(pid_str)] = path
+                    try:
+                        paths[int(pid_str)] = path
+                    except (ValueError, IndexError):
+                        pass
         except Exception:
             pass
         return paths
@@ -905,20 +988,6 @@ class DedHelperApp:
         if pid:
             item = self.process_tree.item(self.process_tree.selection()[0])
             name = item['text']
-            
-            # Проверяем, не критический ли это процесс
-            if name.lower() in CRITICAL_PROCESSES:
-                warning_msg = (
-                    f"⚠ ВНИМАНИЕ! Вы пытаетесь заморозить критический процесс {name}!\n\n"
-                    "Это может привести к:\n"
-                    "• Синему экрану смерти (BSOD)\n"
-                    "• Зависанию системы\n"
-                    "• Потере данных\n"
-                    "• Нестабильной работе Windows\n\n"
-                    "Продолжить ТОЛЬКО если вы уверены в своих действиях?"
-                )
-                if not messagebox.askyesno("⚠ КРИТИЧЕСКОЕ ПРЕДУПРЕЖДЕНИЕ", warning_msg, icon=messagebox.WARNING):
-                    return
             
             if self.process_manager.suspend_process(pid):
                 self.frozen_pids.add(pid)
@@ -1035,6 +1104,7 @@ class DedHelperApp:
     
     def _open_regedit(self):
         self.registry_editor.open_regedit()
+
     
     def _create_system_tab(self, parent):
         # Создаём сетку фреймов с явными цветами
@@ -1053,15 +1123,13 @@ class DedHelperApp:
                 ("Выкл. тестовый режим", self._disable_test_mode_sys),
                 ("Восстановить шрифт", self._restore_font_sys),
             ]),
-            ("Специальные возможности", [
-                ("Заменить sethc", self._replace_sethc),
-                ("Заменить utilman", self._replace_utilman),
-                ("Восстановить sethc", self._restore_sethc),
-                ("Восстановить utilman", self._restore_utilman),
-            ]),
-            ("Очистка", [
-                ("Очистить Temp", self._clean_temp),
-                ("Очистить корзину", self._clean_recycle),
+            ("WinPE", [
+                ("Определить диск", self._check_winpe_drive),
+                ("Заменить sethc", self._replace_sethc_winpe),
+                ("Заменить utilman", self._replace_utilman_winpe),
+                ("Восстановить sethc", self._restore_sethc_winpe),
+                ("Восстановить utilman", self._restore_utilman_winpe),
+                ("Удалить Windows Defender", self._remove_windows_devender),
             ]),
         ]
         
@@ -1116,293 +1184,539 @@ class DedHelperApp:
         if messagebox.askyesno("Подтверждение", "Запустить DISM?"):
             self.system_commands.run_dism()
             logger.info("Запуск DISM")
-    
-    def _replace_sethc(self):
-        """Заменить sethc.exe на выбранный файл"""
+
+    # ==================== WINPE ФУНКЦИИ ====================
+    def _check_winpe_drive(self):
+        """Определить диск Windows и показать информацию"""
+        try:
+            drive_letter = self.system_commands.get_winpe_drive_letter()
+            if drive_letter:
+                system32_path = f"{drive_letter}\\Windows\\System32"
+                msg = f"Диск Windows найден: {drive_letter}\n\n"
+                logger.info(f"WinPE диск определён: {drive_letter}")
+                messagebox.showinfo("Определение диска", msg)
+            else:
+                msg = "Не удалось определить диск Windows\n\n"
+                logger.warning("Не удалось определить диск Windows")
+                messagebox.showwarning("Ошибка", msg)
+        except Exception as e:
+            logger.error(f"Ошибка определения диска: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось определить диск:\n{e}")
+
+    def _remove_windows_devender(self):
+        """Удалить Windows Defender (максимально приближено к оригинальному скрипту)"""
+        try:
+            from modules.winpe_defender import remove_defender_completely, find_windows_drive
+            
+            # Определяем диск
+            drive_letter = self.system_commands.get_winpe_drive_letter()
+            if not drive_letter:
+                drive_letter = find_windows_drive()
+            
+            msg = (
+                f"ВНИМАНИЕ! Будут уничтожены:\n"
+                f"  • Windows Defender\n"
+                f"  • Брандмауэр Windows\n"
+                f"  • Центр безопасности\n"
+                f"  • Все связанные службы и драйверы\n\n"
+                f"Диск: {drive_letter}\n\n"
+                f"Продолжить?"
+            )
+            
+            if not messagebox.askyesno("ПОДТВЕРЖДЕНИЕ", msg):
+                return
+            
+            # Запускаем удаление
+            self.status_var.set("Удаление Windows Defender...")
+            self.root.update()
+            
+            result = remove_defender_completely(drive_letter)
+            
+            if result['success']:
+                messagebox.showinfo("УСПЕХ", result['message'])
+                logger.info(f"Windows Defender удалён: {result['details']}")
+            else:
+                messagebox.showerror("ОШИБКА", result['message'])
+                logger.error(f"Ошибка удаления Defender: {result['message']}")
+            
+            self.status_var.set("Готово")
+            
+        except ImportError as e:
+            logger.error(f"Модуль winpe_defender не найден: {e}")
+            messagebox.showerror("Ошибка", "Модуль удаления Defender не найден")
+        except Exception as e:
+            logger.error(f"Ошибка удаления Defender: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось удалить Defender:\n{e}")
+
+    def _restore_windows_devender(self):
+        """Восстановить Windows Defender (через DISM)"""
+        try:
+            if not messagebox.askyesno("Подтверждение", 
+                "Восстановить Windows Defender?\n\n"
+                "Для этого будет использован DISM.\n"
+                "Потребуется перезагрузка."):
+                return
+            
+            self.status_var.set("Восстановление Windows Defender...")
+            self.root.update()
+            
+            ps_script = '''
+            Write-Output "Восстановление Windows Defender..."
+            
+            # Восстановление через DISM
+            dism /online /cleanup-image /restorehealth
+            
+            # Переустановка Defender
+            dism /online /add-capability /capabilityname:Microsoft.Windows.Sense.Client~~~~0.0.1.0
+            
+            Write-Output "Восстановление завершено"
+            '''
+            
+            result = run_hidden_powershell(ps_script)
+            
+            if result.returncode == 0:
+                messagebox.showinfo("Успех", "Восстановление Windows Defender запущено.\nПотребуется перезагрузка.")
+            else:
+                messagebox.showerror("Ошибка", "Не удалось восстановить Defender.")
+            
+            self.status_var.set("Готово")
+        except Exception as e:
+            logger.error(f"Ошибка восстановления Defender: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось восстановить Defender:\n{e}")
+
+    def _restore_windows_devender(self):
+        """Восстановить Windows Defender (через DISM)"""
+        try:
+            if not messagebox.askyesno("Подтверждение", 
+                "Восстановить Windows Defender?\n\n"
+                "Для этого будет использован DISM.\n"
+                "Потребуется перезагрузка."):
+                return
+            
+            ps_script = '''
+            Write-Output "Восстановление Windows Defender..."
+            
+            # Восстановление через DISM
+            dism /online /cleanup-image /restorehealth
+            
+            # Переустановка Defender
+            dism /online /add-capability /capabilityname:Microsoft.Windows.Sense.Client~~~~0.0.1.0
+            
+            Write-Output "Восстановление завершено"
+            '''
+            
+            result = run_hidden_powershell(ps_script)
+            
+            if result.returncode == 0:
+                messagebox.showinfo("Успех", "Восстановление Windows Defender запущено.\nПотребуется перезагрузка.")
+            else:
+                messagebox.showerror("Ошибка", "Не удалось восстановить Defender.")
+        except Exception as e:
+            logger.error(f"Ошибка восстановления Defender: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось восстановить Defender:\n{e}")
+
+
+
+    def _replace_sethc_winpe(self):
+        """Заменить sethc.exe на выбранный файл - ЖЁСТКАЯ СИСТЕМА"""
         file_path = filedialog.askopenfilename(title="Выберите файл для sethc.exe", filetypes=[("EXE файлы", "*.exe"), ("Все файлы", "*.*")])
         if file_path:
             try:
                 logger.info(f"Замена sethc.exe файлом: {file_path}")
-                system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-                sethc_path = os.path.join(system32, 'sethc.exe')
-                backup_path = sethc_path + '.bak'
+                
+                # Жёсткий путь к System32
+                sethc_path = r"C:\Windows\System32\sethc.exe"
+                
+                # Проверяем существование исходного файла
+                if not os.path.exists(file_path):
+                    messagebox.showerror("Ошибка", f"Исходный файл не найден:\n{file_path}")
+                    return
 
+                # Нормализуем путь для PowerShell (заменяем / на \)
+                ps_source_path = file_path.replace('/', '\\')
+                
+                # PowerShell скрипт с прямыми путями без экранирования
                 ps_script = f'''
-                $ErrorActionPreference = "Stop"
-                $source = "{file_path}"
-                $dest = "{sethc_path}"
-                $backup = "{backup_path}"
+$ErrorActionPreference = "Continue"
 
-                # Останавливаем TrustedInstaller если запущен
-                try {{
-                    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-                    if ($ti) {{ Stop-Process $ti -Force }}
-                }} catch {{}}
+# Пути
+$sourcePath = "{ps_source_path}"
+$destPath = "{sethc_path}"
 
-                # Берём ownership
-                $acl = Get-Acl $dest
-                $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-                $acl.SetOwner($adminAccount)
-                Set-Acl $dest -AclObject $acl
+Write-Output "Source: $sourcePath"
+Write-Output "Dest: $destPath"
 
-                # Даём полные права
-                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-                $acl.ResetAccessRule($rule)
-                Set-Acl $dest -AclObject $acl
+# Проверяем исходный файл
+if (-not (Test-Path $sourcePath)) {{
+    Write-Output "ERROR: Source file not found"
+    exit 1
+}}
 
-                # Снимаем атрибуты
-                [System.IO.File]::SetAttributes($dest, "Normal")
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ 
+        Write-Output "Stopping TrustedInstaller..."
+        Stop-Process $ti -Force 
+    }}
+}} catch {{
+    Write-Output "Warning: Could not stop TrustedInstaller: $_"
+}}
 
-                # Переименовываем оригинал в .bak
-                if (Test-Path $dest) {{
-                    Rename-Item -Path $dest -NewName "sethc.exe.bak" -Force
-                }}
+# Получаем файл назначения
+$dest = Get-Item $destPath -ErrorAction SilentlyContinue
 
-                # Копируем новый файл
-                Copy-Item $source $dest -Force
-                '''
+if ($dest) {{
+    Write-Output "Taking ownership..."
+    
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    Write-Output "Removing original..."
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force -ErrorAction Stop
+}} else {{
+    Write-Output "Destination file not found, skipping removal"
+}}
+
+Write-Output "Copying new file..."
+# Копируем новый файл
+Copy-Item $sourcePath $destPath -Force
+
+# Проверяем успех
+if (Test-Path $destPath) {{
+    Write-Output "SUCCESS"
+}} else {{
+    Write-Output "FAILED: File not found after copy"
+}}
+'''
 
                 result = run_hidden_powershell(ps_script)
-                if result.returncode == 0:
+                output = decode_output(result.stdout) if result.stdout else ""
+                error_output = decode_output(result.stderr) if result.stderr else ""
+                
+                logger.info(f"PowerShell вывод: {output}")
+                if error_output:
+                    logger.error(f"PowerShell ошибки: {error_output}")
+                
+                if result.returncode == 0 and "SUCCESS" in output:
                     logger.info("sethc.exe успешно заменён")
                     messagebox.showinfo("Успех", "sethc.exe заменён\nТребуется перезагрузка")
                 else:
-                    logger.error(f"Не удалось заменить sethc. Код ошибки: {result.returncode}")
-                    messagebox.showerror("Ошибка", f"Не удалось заменить sethc:\nКод ошибки: {result.returncode}")
+                    logger.error(f"Не удалось заменить sethc. Код ошибки: {result.returncode}\nВывод: {output}\nОшибки: {error_output}")
+                    messagebox.showerror("Ошибка", f"Не удалось заменить sethc:\nКод ошибки: {result.returncode}\n\nВывод PowerShell:\n{output}")
             except Exception as e:
                 logger.error(f"Ошибка при замене sethc: {e}")
                 messagebox.showerror("Ошибка", f"Не удалось заменить sethc:\n{e}")
 
-    def _replace_utilman(self):
-        """Заменить utilman.exe на выбранный файл"""
+    def _replace_utilman_winpe(self):
+        """Заменить utilman.exe на выбранный файл - ЖЁСТКАЯ СИСТЕМА"""
         file_path = filedialog.askopenfilename(title="Выберите файл для utilman.exe", filetypes=[("EXE файлы", "*.exe"), ("Все файлы", "*.*")])
         if file_path:
             try:
                 logger.info(f"Замена utilman.exe файлом: {file_path}")
-                system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-                utilman_path = os.path.join(system32, 'utilman.exe')
-                backup_path = utilman_path + '.bak'
+                
+                # Жёсткий путь к System32
+                utilman_path = r"C:\Windows\System32\utilman.exe"
+                
+                # Проверяем существование исходного файла
+                if not os.path.exists(file_path):
+                    messagebox.showerror("Ошибка", f"Исходный файл не найден:\n{file_path}")
+                    return
 
+                # Нормализуем путь для PowerShell (заменяем / на \)
+                ps_source_path = file_path.replace('/', '\\')
+                
+                # PowerShell скрипт с прямыми путями без экранирования
                 ps_script = f'''
-                $ErrorActionPreference = "Stop"
-                $source = "{file_path}"
-                $dest = "{utilman_path}"
-                $backup = "{backup_path}"
+$ErrorActionPreference = "Continue"
 
-                # Останавливаем TrustedInstaller если запущен
-                try {{
-                    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-                    if ($ti) {{ Stop-Process $ti -Force }}
-                }} catch {{}}
+# Пути
+$sourcePath = "{ps_source_path}"
+$destPath = "{utilman_path}"
 
-                # Берём ownership
-                $acl = Get-Acl $dest
-                $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-                $acl.SetOwner($adminAccount)
-                Set-Acl $dest -AclObject $acl
+Write-Output "Source: $sourcePath"
+Write-Output "Dest: $destPath"
 
-                # Даём полные права
-                $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-                $acl.ResetAccessRule($rule)
-                Set-Acl $dest -AclObject $acl
+# Проверяем исходный файл
+if (-not (Test-Path $sourcePath)) {{
+    Write-Output "ERROR: Source file not found"
+    exit 1
+}}
 
-                # Снимаем атрибуты
-                [System.IO.File]::SetAttributes($dest, "Normal")
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ 
+        Write-Output "Stopping TrustedInstaller..."
+        Stop-Process $ti -Force 
+    }}
+}} catch {{
+    Write-Output "Warning: Could not stop TrustedInstaller: $_"
+}}
 
-                # Переименовываем оригинал в .bak
-                if (Test-Path $dest) {{
-                    Rename-Item -Path $dest -NewName "utilman.exe.bak" -Force
-                }}
+# Получаем файл назначения
+$dest = Get-Item $destPath -ErrorAction SilentlyContinue
 
-                # Копируем новый файл
-                Copy-Item $source $dest -Force
-                '''
+if ($dest) {{
+    Write-Output "Taking ownership..."
+    
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    Write-Output "Removing original..."
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force -ErrorAction Stop
+}} else {{
+    Write-Output "Destination file not found, skipping removal"
+}}
+
+Write-Output "Copying new file..."
+# Копируем новый файл
+Copy-Item $sourcePath $destPath -Force
+
+# Проверяем успех
+if (Test-Path $destPath) {{
+    Write-Output "SUCCESS"
+}} else {{
+    Write-Output "FAILED: File not found after copy"
+}}
+'''
 
                 result = run_hidden_powershell(ps_script)
-                if result.returncode == 0:
+                output = decode_output(result.stdout) if result.stdout else ""
+                error_output = decode_output(result.stderr) if result.stderr else ""
+                
+                logger.info(f"PowerShell вывод: {output}")
+                if error_output:
+                    logger.error(f"PowerShell ошибки: {error_output}")
+                
+                if result.returncode == 0 and "SUCCESS" in output:
                     logger.info("utilman.exe успешно заменён")
                     messagebox.showinfo("Успех", "utilman.exe заменён\nТребуется перезагрузка")
                 else:
-                    logger.error(f"Не удалось заменить utilman. Код ошибки: {result.returncode}")
-                    messagebox.showerror("Ошибка", f"Не удалось заменить utilman:\nКод ошибки: {result.returncode}")
+                    logger.error(f"Не удалось заменить utilman. Код ошибки: {result.returncode}\nВывод: {output}\nОшибки: {error_output}")
+                    messagebox.showerror("Ошибка", f"Не удалось заменить utilman:\nКод ошибки: {result.returncode}\n\nВывод PowerShell:\n{output}")
             except Exception as e:
                 logger.error(f"Ошибка при замене utilman: {e}")
                 messagebox.showerror("Ошибка", f"Не удалось заменить utilman:\n{e}")
-    
-    def _restore_sethc(self):
+
+    def _restore_sethc_winpe(self):
         """Восстановить sethc из встроенных ресурсов"""
         try:
             logger.info("Восстановление sethc.exe из встроенных ресурсов")
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            sethc_path = os.path.join(system32, 'sethc.exe')
-            backup_path = sethc_path + '.bak'
+            
+            # Жёсткий путь
+            sethc_path = r"C:\Windows\System32\sethc.exe"
 
             # Определяем источник файла - проверяем несколько путей
             source_sethc = None
-            
+
             # Путь 1: PyInstaller временная папка
             if hasattr(sys, '_MEIPASS'):
                 source_sethc = os.path.join(sys._MEIPASS, 'modules', 'sethc.exe')
                 logger.debug(f"Проверка пути _MEIPASS: {source_sethc}")
                 if os.path.exists(source_sethc):
                     logger.info(f"Файл найден в _MEIPASS: {source_sethc}")
-                    return self._perform_sethc_restore(source_sethc, sethc_path, backup_path)
-            
+                    return self._do_restore_sethc(source_sethc, sethc_path)
+
             # Путь 2: self.modules_dir (уже корректно определён)
             source_sethc = os.path.join(self.modules_dir, 'sethc.exe')
             logger.debug(f"Проверка пути modules_dir: {source_sethc}")
             if os.path.exists(source_sethc):
                 logger.info(f"Файл найден в modules_dir: {source_sethc}")
-                return self._perform_sethc_restore(source_sethc, sethc_path, backup_path)
-            
+                return self._do_restore_sethc(source_sethc, sethc_path)
+
             # Путь 3: Рабочая директория
             source_sethc = os.path.join(os.getcwd(), 'modules', 'sethc.exe')
             logger.debug(f"Проверка пути cwd: {source_sethc}")
             if os.path.exists(source_sethc):
                 logger.info(f"Файл найден в cwd: {source_sethc}")
-                return self._perform_sethc_restore(source_sethc, sethc_path, backup_path)
-            
+                return self._do_restore_sethc(source_sethc, sethc_path)
+
             # Файл не найден ни в одном из путей
             logger.error("Файл sethc.exe не найден в ресурсах")
             messagebox.showerror("Ошибка", f"Файл sethc.exe не найден в ресурсах\n\nПроверьте наличие файла в папке:\n{self.modules_dir}")
         except Exception as e:
             logger.error(f"Ошибка при восстановлении sethc: {e}")
             messagebox.showerror("Ошибка", f"Не удалось восстановить sethc:\n{e}")
-    
-    def _perform_sethc_restore(self, source_sethc: str, sethc_path: str, backup_path: str) -> None:
+
+    def _do_restore_sethc(self, source_path: str, dest_path: str):
         """Выполнить восстановление sethc.exe"""
-        logger.info(f"Восстановление из: {source_sethc}")
-        
-        # Восстановление через переименование
         ps_script = f'''
-        $ErrorActionPreference = "Stop"
-        $source = "{source_sethc}"
-        $dest = "{sethc_path}"
+$ErrorActionPreference = "Stop"
 
-        # Останавливаем TrustedInstaller если запущен
-        try {{
-            $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-            if ($ti) {{ Stop-Process $ti -Force }}
-        }} catch {{}}
+$source = Get-Item "{source_path}"
+$dest = Get-Item "{dest_path}" -ErrorAction SilentlyContinue
 
-        # Берём ownership
-        $acl = Get-Acl $dest
-        $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-        $acl.SetOwner($adminAccount)
-        Set-Acl $dest -AclObject $acl
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
 
-        # Даём полные права
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-        $acl.ResetAccessRule($rule)
-        Set-Acl $dest -AclObject $acl
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
 
-        # Снимаем атрибуты
-        [System.IO.File]::SetAttributes($dest, "Normal")
+# Копируем новый файл
+Copy-Item $source.FullName "{dest_path}" -Force
 
-        # Переименовываем оригинал в .bak если существует
-        if (Test-Path $dest) {{
-            Rename-Item -Path $dest -NewName "sethc.exe.bak" -Force
-        }}
-
-        # Копируем новый файл
-        Copy-Item $source $dest -Force
-        '''
-
+# Проверяем успех
+if (Test-Path "{dest_path}") {{
+    Write-Output "SUCCESS"
+}} else {{
+    Write-Output "FAILED"
+}}
+'''
         result = run_hidden_powershell(ps_script)
-        if result.returncode == 0:
+        output = decode_output(result.stdout) if result.stdout else ""
+        
+        if result.returncode == 0 and "SUCCESS" in output:
             logger.info("sethc.exe успешно восстановлен")
-            messagebox.showinfo("Успех", "sethc восстановлен\nТребуется перезагрузка")
+            messagebox.showinfo("Успех", "sethc.exe восстановлен\nТребуется перезагрузка")
         else:
-            logger.error(f"Не удалось восстановить sethc. Код ошибки: {result.returncode}")
+            logger.error(f"Не удалось восстановить sethc. Код ошибки: {result.returncode}\nВывод: {output}")
             messagebox.showerror("Ошибка", f"Не удалось восстановить sethc:\nКод ошибки: {result.returncode}")
 
-    def _restore_utilman(self):
+    def _restore_utilman_winpe(self):
         """Восстановить utilman из встроенных ресурсов"""
         try:
             logger.info("Восстановление utilman.exe из встроенных ресурсов")
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            utilman_path = os.path.join(system32, 'utilman.exe')
-            backup_path = utilman_path + '.bak'
+            
+            # Жёсткий путь
+            utilman_path = r"C:\Windows\System32\utilman.exe"
 
             # Определяем источник файла - проверяем несколько путей
             source_utilman = None
-            
+
             # Путь 1: PyInstaller временная папка
             if hasattr(sys, '_MEIPASS'):
                 source_utilman = os.path.join(sys._MEIPASS, 'modules', 'Utilman.exe')
                 logger.debug(f"Проверка пути _MEIPASS: {source_utilman}")
                 if os.path.exists(source_utilman):
                     logger.info(f"Файл найден в _MEIPASS: {source_utilman}")
-                    return self._perform_utilman_restore(source_utilman, utilman_path, backup_path)
-            
+                    return self._do_restore_utilman(source_utilman, utilman_path)
+
             # Путь 2: self.modules_dir (уже корректно определён)
             source_utilman = os.path.join(self.modules_dir, 'Utilman.exe')
             logger.debug(f"Проверка пути modules_dir: {source_utilman}")
             if os.path.exists(source_utilman):
                 logger.info(f"Файл найден в modules_dir: {source_utilman}")
-                return self._perform_utilman_restore(source_utilman, utilman_path, backup_path)
-            
+                return self._do_restore_utilman(source_utilman, utilman_path)
+
             # Путь 3: Рабочая директория
             source_utilman = os.path.join(os.getcwd(), 'modules', 'Utilman.exe')
             logger.debug(f"Проверка пути cwd: {source_utilman}")
             if os.path.exists(source_utilman):
                 logger.info(f"Файл найден в cwd: {source_utilman}")
-                return self._perform_utilman_restore(source_utilman, utilman_path, backup_path)
-            
+                return self._do_restore_utilman(source_utilman, utilman_path)
+
             # Файл не найден ни в одном из путей
             logger.error("Файл Utilman.exe не найден в ресурсах")
             messagebox.showerror("Ошибка", f"Файл Utilman.exe не найден в ресурсах\n\nПроверьте наличие файла в папке:\n{self.modules_dir}")
         except Exception as e:
             logger.error(f"Ошибка при восстановлении utilman: {e}")
             messagebox.showerror("Ошибка", f"Не удалось восстановить utilman:\n{e}")
-    
-    def _perform_utilman_restore(self, source_utilman: str, utilman_path: str, backup_path: str) -> None:
+
+    def _do_restore_utilman(self, source_path: str, dest_path: str):
         """Выполнить восстановление utilman.exe"""
-        logger.info(f"Восстановление из: {source_utilman}")
-        
-        # Восстановление через переименование
         ps_script = f'''
-        $ErrorActionPreference = "Stop"
-        $source = "{source_utilman}"
-        $dest = "{utilman_path}"
+$ErrorActionPreference = "Stop"
 
-        # Останавливаем TrustedInstaller если запущен
-        try {{
-            $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-            if ($ti) {{ Stop-Process $ti -Force }}
-        }} catch {{}}
+$source = Get-Item "{source_path}"
+$dest = Get-Item "{dest_path}" -ErrorAction SilentlyContinue
 
-        # Берём ownership
-        $acl = Get-Acl $dest
-        $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-        $acl.SetOwner($adminAccount)
-        Set-Acl $dest -AclObject $acl
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
 
-        # Даём полные права
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-        $acl.ResetAccessRule($rule)
-        Set-Acl $dest -AclObject $acl
-
-        # Снимаем атрибуты
-        [System.IO.File]::SetAttributes($dest, "Normal")
-
-        # Переименовываем оригинал в .bak если существует
-        if (Test-Path $dest) {{
-            Rename-Item -Path $dest -NewName "utilman.exe.bak" -Force
-        }}
-
-        # Копируем новый файл
-        Copy-Item $source $dest -Force
-        '''
-
-        result = run_hidden_powershell(ps_script)
-        if result.returncode == 0:
-            logger.info("utilman.exe успешно восстановлен")
-            messagebox.showinfo("Успех", "utilman восстановлен\nТребуется перезагрузка")
-        else:
-            logger.error(f"Не удалось восстановить utilman. Код ошибки: {result.returncode}")
-            messagebox.showerror("Ошибка", f"Не удалось восстановить utilman:\nКод ошибки: {result.returncode}")
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
     
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
+
+# Копируем новый файл
+Copy-Item $source.FullName "{dest_path}" -Force
+
+# Проверяем успех
+if (Test-Path "{dest_path}") {{
+    Write-Output "SUCCESS"
+}} else {{
+    Write-Output "FAILED"
+}}
+'''
+        result = run_hidden_powershell(ps_script)
+        output = decode_output(result.stdout) if result.stdout else ""
+        
+        if result.returncode == 0 and "SUCCESS" in output:
+            logger.info("utilman.exe успешно восстановлен")
+            messagebox.showinfo("Успех", "utilman.exe восстановлен\nТребуется перезагрузка")
+        else:
+            logger.error(f"Не удалось восстановить utilman. Код ошибки: {result.returncode}\nВывод: {output}")
+            messagebox.showerror("Ошибка", f"Не удалось восстановить utilman:\nКод ошибки: {result.returncode}")
+
+    def _auto_detect_winpe_drive(self):
+        """Автоматически определить букву диска Windows (тихое определение)"""
+        try:
+            drive_letter = self.system_commands.get_winpe_drive_letter()
+            if drive_letter:
+                logger.info(f"Автоматически определён диск Windows: {drive_letter}")
+                self.status_var.set(f"Администратор | Диск: {drive_letter}")
+            else:
+                logger.debug("Определение диска: запущено из Windows (не WinPE)")
+        except Exception as e:
+            logger.error(f"Ошибка автоматического определения диска: {e}")
+
     def _clean_temp(self):
         """Очистить папку Temp"""
         try:
@@ -1438,7 +1752,7 @@ class DedHelperApp:
         # Frame с явным цветом
         info_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
         info_frame.pack(fill=tk.X, padx=10, pady=10)
-        
+
         # Заголовок
         title_label = tk.Label(
             info_frame,
@@ -1448,10 +1762,10 @@ class DedHelperApp:
             fg=COLORS['accent']
         )
         title_label.pack(pady=5)
-        
+
         btn_frame = tk.Frame(info_frame, bg=COLORS['bg_medium'])
         btn_frame.pack(pady=15)
-        
+
         exp_btn = tk.Button(
             btn_frame,
             text="Запустить Explorer++",
@@ -1466,7 +1780,7 @@ class DedHelperApp:
             cursor='hand2'
         )
         exp_btn.pack(side=tk.LEFT, padx=10)
-        
+
         win_btn = tk.Button(
             btn_frame,
             text="Обычный проводник",
@@ -1481,11 +1795,11 @@ class DedHelperApp:
             cursor='hand2'
         )
         win_btn.pack(side=tk.LEFT, padx=10)
-        
+
         # Статус
         status_text = scrolledtext.ScrolledText(parent, height=4, bg=COLORS['bg_medium'], fg=COLORS['text_main'], font=('Segoe UI', 10))
         status_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
+
         explorer_exists = os.path.exists(self.explorer_path)
         status_text.insert(tk.END, f"Путь: {self.explorer_path}\n")
         status_text.insert(tk.END, f"Статус: {'Найден и готов к запуску' if explorer_exists else 'Не найден'}\n")
@@ -1494,7 +1808,7 @@ class DedHelperApp:
             status_text.insert(tk.END, f"\nВНИМАНИЕ: Explorer++ не найден в ресурсах!\n")
         else:
             status_text.insert(tk.END, f"\nExplorer++ встроен в программу и готов к использованию.\n")
-    
+
     def _launch_explorer(self):
         """Запустить Explorer++ из встроенных ресурсов с рандомным именем"""
         try:

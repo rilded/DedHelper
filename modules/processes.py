@@ -19,6 +19,7 @@ PROCESS_SET_INFORMATION = 0x0200
 PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_VM_READ = 0x0010
 PROCESS_DUP_HANDLE = 0x0040
+PROCESS_ALL_ACCESS = 0x001F0FFF
 
 # Приоритеты процессов
 IDLE_PRIORITY_CLASS = 0x00000040
@@ -34,6 +35,15 @@ logger = logging.getLogger(__name__)
 # Импорты из ntdll (взято из SimpleUnlocker Utils.cs)
 ntdll = ctypes.windll.ntdll
 
+
+def generate_random_name(length: int = 8) -> str:
+    """Сгенерировать случайное имя для процесса"""
+    import random
+    import string
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
 def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.CompletedProcess:
     """Выполнить команду без показа окна консоли"""
     startupinfo = subprocess.STARTUPINFO()
@@ -44,25 +54,77 @@ def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.Com
         cmd,
         shell=True,
         capture_output=capture_output,
-        text=True,
         startupinfo=startupinfo,
         creationflags=CREATE_NO_WINDOW
     )
 
 
-def run_hidden_powershell(ps_command: str, capture_output: bool = True) -> subprocess.CompletedProcess:
-    """Выполнить PowerShell команду без показа окна"""
+def run_hidden_powershell(ps_command: str, capture_output: bool = True, random_name: bool = True) -> subprocess.CompletedProcess:
+    """
+    Выполнить PowerShell команду без показа окна
+    
+    Args:
+        ps_command: Команда PowerShell для выполнения
+        capture_output: Захватывать ли вывод
+        random_name: Запускать ли с случайным именем процесса
+    """
+    import tempfile
+    import shutil
+    
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
+    
+    if random_name:
+        # Создаём копию powershell.exe со случайным именем
+        temp_dir = tempfile.mkdtemp(prefix='PS_')
+        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+        random_name_file = generate_random_name(12) + '.exe'
+        ps_copy = os.path.join(temp_dir, random_name_file)
+        
+        try:
+            shutil.copy2(ps_exe, ps_copy)
+        except Exception as e:
+            logger.error(f"Не удалось создать копию PowerShell: {e}")
+            ps_copy = ps_exe
+        
+        return subprocess.run(
+            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
+    else:
+        return subprocess.run(
+            ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
 
-    return subprocess.run(
-        ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-        capture_output=capture_output,
-        text=True,
-        startupinfo=startupinfo,
-        creationflags=CREATE_NO_WINDOW
-    )
+
+def decode_output(stdout_bytes: bytes) -> str:
+    """
+    Декодировать вывод команды с обработкой ошибок кодировки
+    
+    Args:
+        stdout_bytes: Байты вывода команды
+        
+    Returns:
+        str: Декодированная строка
+    """
+    if not stdout_bytes:
+        return ""
+    
+    # Пробуем UTF-8, затем cp1251 (кириллица Windows), затем с заменой ошибок
+    for encoding in ['utf-8', 'cp1251', 'cp866']:
+        try:
+            return stdout_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    
+    # Если ничего не подошло, декодируем с заменой некорректных символов
+    return stdout_bytes.decode('utf-8', errors='replace')
 
 
 class ProcessManager:
@@ -79,8 +141,11 @@ class ProcessManager:
         try:
             # Используем tasklist для получения информации
             result = run_hidden_command('tasklist /fo CSV /nh /v', capture_output=True)
+            
+            # Декодируем вывод с обработкой ошибок кодировки
+            stdout = decode_output(result.stdout) if result.stdout else ""
 
-            lines = result.stdout.strip().split('\n')
+            lines = stdout.strip().split('\n')
             for line in lines:
                 if line:
                     # Парсим CSV
@@ -177,17 +242,20 @@ class ProcessManager:
         Использует NtQueryInformationProcess с ProcessBreakOnTermination (29)
         """
         try:
+            # Открываем процесс с правами QUERY_INFORMATION
             handle = self.open_process(pid, PROCESS_QUERY_INFORMATION)
             if handle:
-                value = ctypes.c_uint(0)
-                size = ctypes.c_int()
-                # ProcessBreakOnTermination = 29
-                result = self.ntdll.NtQueryInformationProcess(handle, 29, ctypes.byref(value), ctypes.sizeof(ctypes.c_uint), ctypes.byref(size))
-                self.close_process(handle)
-                if result == 0 and size.value == ctypes.sizeof(ctypes.c_uint):
-                    is_critical = value.value != 0
-                    logger.debug(f"Процесс {pid} критический: {is_critical}")
-                    return is_critical
+                try:
+                    value = ctypes.c_uint(0)
+                    size = ctypes.c_int()
+                    # ProcessBreakOnTermination = 29
+                    result = self.ntdll.NtQueryInformationProcess(handle, 29, ctypes.byref(value), ctypes.sizeof(ctypes.c_uint), ctypes.byref(size))
+                    if result == 0 and size.value == ctypes.sizeof(ctypes.c_uint):
+                        is_critical = value.value != 0
+                        logger.debug(f"Процесс {pid} критический: {is_critical}")
+                        return is_critical
+                finally:
+                    self.close_process(handle)
             return False
         except Exception as e:
             logger.error(f"Ошибка проверки критичности процесса {pid}: {e}")
@@ -197,22 +265,32 @@ class ProcessManager:
         """
         Снять флаг "критический процесс" (метод из SimpleUnlocker TMCore.cs)
         Использует NtSetInformationProcess с ProcessBreakOnTermination (0x1D = 29)
+        
+        ВАЖНО: Нужно открывать процесс с PROCESS_ALL_ACCESS правами!
         """
         try:
             # ProcessBreakOnTermination = 0x1D (29)
             BreakOnTermination = 0x1D
-            
-            handle = self.open_process(pid, PROCESS_SET_INFORMATION)
+
+            # Открываем процесс с ПОЛНЫМИ правами (как в SimpleUnlocker)
+            handle = self.open_process(pid, PROCESS_ALL_ACCESS)
             if handle:
-                is_critical = ctypes.c_int(0)  # 0 = не критический
-                # NtSetInformationProcess из SimpleUnlocker
-                result = self.ntdll.NtSetInformationProcess(handle, BreakOnTermination, ctypes.byref(is_critical), ctypes.sizeof(ctypes.c_int))
-                self.close_process(handle)
-                if result == 0:
-                    logger.info(f"Критический флаг снят с процесса {pid}")
-                    return True
-                else:
-                    logger.error(f"Ошибка снятия флага критичности. NTSTATUS: {result:X}")
+                try:
+                    is_critical = ctypes.c_int(0)  # 0 = не критический
+                    # NtSetInformationProcess из SimpleUnlocker
+                    result = self.ntdll.NtSetInformationProcess(handle, BreakOnTermination, ctypes.byref(is_critical), ctypes.sizeof(ctypes.c_int))
+                    if result == 0:
+                        logger.info(f"Критический флаг снят с процесса {pid}")
+                        return True
+                    else:
+                        logger.error(f"Ошибка снятия флага критичности. NTSTATUS: 0x{result:08X}")
+                        # Проверяем на доступ denied
+                        if result == 0xC0000022:
+                            logger.error("STATUS_ACCESS_DENIED - нужны права администратора")
+                        elif result == 0xC0000035:
+                            logger.error("STATUS_OBJECT_NAME_NOT_FOUND - процесс не найден")
+                finally:
+                    self.close_process(handle)
             return False
         except Exception as e:
             logger.error(f"Ошибка снятия флага критичности: {e}")

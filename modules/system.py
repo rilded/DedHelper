@@ -16,35 +16,95 @@ CREATE_NO_WINDOW = 0x08000000
 logger = logging.getLogger(__name__)
 
 
+def generate_random_name(length: int = 8) -> str:
+    """Сгенерировать случайное имя для процесса"""
+    import random
+    import string
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
+
 def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.CompletedProcess:
     """Выполнить команду без показа окна консоли"""
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    
+
     return subprocess.run(
         cmd,
         shell=True,
         capture_output=capture_output,
-        text=True,
         startupinfo=startupinfo,
         creationflags=CREATE_NO_WINDOW
     )
 
 
-def run_hidden_powershell(ps_command: str, capture_output: bool = True) -> subprocess.CompletedProcess:
-    """Выполнить PowerShell команду без показа окна"""
+def run_hidden_powershell(ps_command: str, capture_output: bool = True, random_name: bool = True) -> subprocess.CompletedProcess:
+    """
+    Выполнить PowerShell команду без показа окна
+    
+    Args:
+        ps_command: Команда PowerShell для выполнения
+        capture_output: Захватывать ли вывод
+        random_name: Запускать ли с случайным именем процесса
+    """
+    import tempfile
+    import shutil
+    
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
     
-    return subprocess.run(
-        ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-        capture_output=capture_output,
-        text=True,
-        startupinfo=startupinfo,
-        creationflags=CREATE_NO_WINDOW
-    )
+    if random_name:
+        # Создаём копию powershell.exe со случайным именем
+        temp_dir = tempfile.mkdtemp(prefix='PS_')
+        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+        random_name_file = generate_random_name(12) + '.exe'
+        ps_copy = os.path.join(temp_dir, random_name_file)
+        
+        try:
+            shutil.copy2(ps_exe, ps_copy)
+        except Exception as e:
+            logger.error(f"Не удалось создать копию PowerShell: {e}")
+            ps_copy = ps_exe
+        
+        return subprocess.run(
+            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
+    else:
+        return subprocess.run(
+            ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output,
+            startupinfo=startupinfo,
+            creationflags=CREATE_NO_WINDOW
+        )
+
+
+def decode_output(stdout_bytes: bytes) -> str:
+    """
+    Декодировать вывод команды с обработкой ошибок кодировки
+    
+    Args:
+        stdout_bytes: Байты вывода команды
+        
+    Returns:
+        str: Декодированная строка
+    """
+    if not stdout_bytes:
+        return ""
+    
+    # Пробуем UTF-8, затем cp1251 (кириллица Windows), затем с заменой ошибок
+    for encoding in ['utf-8', 'cp1251', 'cp866']:
+        try:
+            return stdout_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    
+    # Если ничего не подошло, декодируем с заменой некорректных символов
+    return stdout_bytes.decode('utf-8', errors='replace')
 
 
 class SystemCommands:
@@ -328,9 +388,9 @@ class SystemCommands:
             return False
 
     def replace_sethc(self, target_exe: str) -> bool:
-        """
+        r"""
         Заменить sethc.exe (залипание клавиш) на другую программу
-        Использует переименование оригинала и копирование нового файла
+        ЖЁСТКАЯ СИСТЕМА - прямой путь C:\Windows\System32\sethc.exe
         """
         try:
             # Проверяем существование файла-источника
@@ -338,55 +398,56 @@ class SystemCommands:
                 logger.error(f"Файл-источник не найден: {target_exe}")
                 return False
 
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            sethc_path = os.path.join(system32, 'sethc.exe')
-            backup_path = sethc_path + '.bak'
+            # Жёсткий путь
+            sethc_path = r"C:\Windows\System32\sethc.exe"
 
             logger.info(f"Замена sethc.exe файлом: {target_exe}")
 
-            # Берём ownership через PowerShell
-            self._take_ownership_powershell(sethc_path)
-
-            # Метод через переименование оригинала
+            # PowerShell скрипт с прямыми путями
             ps_script = f'''
-            $ErrorActionPreference = "Stop"
-            $source = "{target_exe}"
-            $dest = "{sethc_path}"
-            $backup = "{backup_path}"
-            
-            # Берём ownership
-            $acl = Get-Acl $dest
-            $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-            $acl.SetOwner($adminAccount)
-            Set-Acl $dest -AclObject $acl
-            
-            # Даём полные права
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-            $acl.ResetAccessRule($rule)
-            Set-Acl $dest -AclObject $acl
-            
-            # Снимаем атрибуты
-            [System.IO.File]::SetAttributes($dest, "Normal")
-            
-            # Переименовываем оригинал в .bak
-            if (Test-Path $dest) {{
-                Rename-Item -Path $dest -NewName "sethc.exe.bak" -Force
-            }}
-            
-            # Копируем новый файл
-            Copy-Item $source $dest -Force
-            '''
-            
+$ErrorActionPreference = "Stop"
+
+$source = Get-Item "{target_exe}"
+$dest = Get-Item "{sethc_path}" -ErrorAction SilentlyContinue
+
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
+
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
+
+# Копируем новый файл
+Copy-Item $source.FullName "{sethc_path}" -Force
+'''
+
             result = run_hidden_powershell(ps_script)
             return result.returncode == 0
         except Exception as e:
-            print(f"Ошибка замены sethc: {e}")
+            logger.error(f"Ошибка замены sethc: {e}")
             return False
 
     def replace_utilman(self, target_exe: str) -> bool:
-        """
+        r"""
         Заменить utilman.exe (специальные возможности) на другую программу
-        Использует переименование оригинала и копирование нового файла
+        ЖЁСТКАЯ СИСТЕМА - прямой путь C:\Windows\System32\utilman.exe
         """
         try:
             # Проверяем существование файла-источника
@@ -394,57 +455,57 @@ class SystemCommands:
                 logger.error(f"Файл-источник не найден: {target_exe}")
                 return False
 
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            utilman_path = os.path.join(system32, 'utilman.exe')
-            backup_path = utilman_path + '.bak'
+            # Жёсткий путь
+            utilman_path = r"C:\Windows\System32\utilman.exe"
 
             logger.info(f"Замена utilman.exe файлом: {target_exe}")
 
-            # Берём ownership через PowerShell
-            self._take_ownership_powershell(utilman_path)
-            
-            # Метод через переименование оригинала
+            # PowerShell скрипт с прямыми путями
             ps_script = f'''
-            $ErrorActionPreference = "Stop"
-            $source = "{target_exe}"
-            $dest = "{utilman_path}"
-            $backup = "{backup_path}"
-            
-            # Берём ownership
-            $acl = Get-Acl $dest
-            $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-            $acl.SetOwner($adminAccount)
-            Set-Acl $dest -AclObject $acl
-            
-            # Даём полные права
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-            $acl.ResetAccessRule($rule)
-            Set-Acl $dest -AclObject $acl
-            
-            # Снимаем атрибуты
-            [System.IO.File]::SetAttributes($dest, "Normal")
-            
-            # Переименовываем оригинал в .bak
-            if (Test-Path $dest) {{
-                Rename-Item -Path $dest -NewName "utilman.exe.bak" -Force
-            }}
-            
-            # Копируем новый файл
-            Copy-Item $source $dest -Force
-            '''
-            
+$ErrorActionPreference = "Stop"
+
+$source = Get-Item "{target_exe}"
+$dest = Get-Item "{utilman_path}" -ErrorAction SilentlyContinue
+
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
+
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
+
+# Копируем новый файл
+Copy-Item $source.FullName "{utilman_path}" -Force
+'''
+
             result = run_hidden_powershell(ps_script)
             return result.returncode == 0
         except Exception as e:
-            print(f"Ошибка замены utilman: {e}")
+            logger.error(f"Ошибка замены utilman: {e}")
             return False
 
     def restore_sethc(self, modules_dir: str = None) -> bool:
         """Восстановить оригинальный sethc.exe из папки modules"""
         try:
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            sethc_path = os.path.join(system32, 'sethc.exe')
-            backup_path = sethc_path + '.bak'
+            # Жёсткий путь
+            sethc_path = r"C:\Windows\System32\sethc.exe"
 
             # Если не указана папка modules, пробуем найти автоматически
             if modules_dir is None:
@@ -455,53 +516,55 @@ class SystemCommands:
 
             # Проверяем наличие файла в modules
             if not os.path.exists(source_sethc):
-                print(f"Файл не найден: {source_sethc}")
+                logger.error(f"Файл не найден: {source_sethc}")
                 return False
 
-            # Берём ownership через PowerShell
-            self._take_ownership_powershell(sethc_path)
-            
-            # Метод через переименование
+            # PowerShell скрипт с прямыми путями
             ps_script = f'''
-            $ErrorActionPreference = "Stop"
-            $source = "{source_sethc}"
-            $dest = "{sethc_path}"
-            
-            # Берём ownership
-            $acl = Get-Acl $dest
-            $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-            $acl.SetOwner($adminAccount)
-            Set-Acl $dest -AclObject $acl
-            
-            # Даём полные права
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-            $acl.ResetAccessRule($rule)
-            Set-Acl $dest -AclObject $acl
-            
-            # Снимаем атрибуты
-            [System.IO.File]::SetAttributes($dest, "Normal")
-            
-            # Переименовываем оригинал в .bak если существует
-            if (Test-Path $dest) {{
-                Rename-Item -Path $dest -NewName "sethc.exe.bak" -Force
-            }}
-            
-            # Копируем новый файл
-            Copy-Item $source $dest -Force
-            '''
-            
+$ErrorActionPreference = "Stop"
+
+$source = Get-Item "{source_sethc}"
+$dest = Get-Item "{sethc_path}" -ErrorAction SilentlyContinue
+
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
+
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
+
+# Копируем новый файл
+Copy-Item $source.FullName "{sethc_path}" -Force
+'''
+
             result = run_hidden_powershell(ps_script)
             return result.returncode == 0
         except Exception as e:
-            print(f"Ошибка восстановления sethc: {e}")
+            logger.error(f"Ошибка восстановления sethc: {e}")
             return False
 
     def restore_utilman(self, modules_dir: str = None) -> bool:
         """Восстановить оригинальный utilman.exe из папки modules"""
         try:
-            system32 = os.environ.get('SYSTEMROOT', r'C:\Windows') + '\\System32'
-            utilman_path = os.path.join(system32, 'utilman.exe')
-            backup_path = utilman_path + '.bak'
+            # Жёсткий путь
+            utilman_path = r"C:\Windows\System32\utilman.exe"
 
             # Если не указана папка modules, пробуем найти автоматически
             if modules_dir is None:
@@ -512,45 +575,48 @@ class SystemCommands:
 
             # Проверяем наличие файла в modules
             if not os.path.exists(source_utilman):
-                print(f"Файл не найден: {source_utilman}")
+                logger.error(f"Файл не найден: {source_utilman}")
                 return False
 
-            # Берём ownership через PowerShell
-            self._take_ownership_powershell(utilman_path)
-            
-            # Метод через переименование
+            # PowerShell скрипт с прямыми путями
             ps_script = f'''
-            $ErrorActionPreference = "Stop"
-            $source = "{source_utilman}"
-            $dest = "{utilman_path}"
-            
-            # Берём ownership
-            $acl = Get-Acl $dest
-            $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-            $acl.SetOwner($adminAccount)
-            Set-Acl $dest -AclObject $acl
-            
-            # Даём полные права
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-            $acl.ResetAccessRule($rule)
-            Set-Acl $dest -AclObject $acl
-            
-            # Снимаем атрибуты
-            [System.IO.File]::SetAttributes($dest, "Normal")
-            
-            # Переименовываем оригинал в .bak если существует
-            if (Test-Path $dest) {{
-                Rename-Item -Path $dest -NewName "utilman.exe.bak" -Force
-            }}
-            
-            # Копируем новый файл
-            Copy-Item $source $dest -Force
-            '''
-            
+$ErrorActionPreference = "Stop"
+
+$source = Get-Item "{source_utilman}"
+$dest = Get-Item "{utilman_path}" -ErrorAction SilentlyContinue
+
+# Останавливаем TrustedInstaller
+try {{
+    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
+    if ($ti) {{ Stop-Process $ti -Force }}
+}} catch {{}}
+
+if ($dest) {{
+    # Берём ownership
+    $acl = Get-Acl $dest.FullName
+    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
+    $acl.SetOwner($adminAccount)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    # Даём полные права
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
+    $acl.ResetAccessRule($rule)
+    Set-Acl $dest.FullName -AclObject $acl
+    
+    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
+    
+    # Удаляем оригинал
+    Remove-Item -Path $dest.FullName -Force
+}}
+
+# Копируем новый файл
+Copy-Item $source.FullName "{utilman_path}" -Force
+'''
+
             result = run_hidden_powershell(ps_script)
             return result.returncode == 0
         except Exception as e:
-            print(f"Ошибка восстановления utilman: {e}")
+            logger.error(f"Ошибка восстановления utilman: {e}")
             return False
 
     # ==================== ЭКСТРЕННОЕ ВОССТАНОВЛЕНИЕ ====================
@@ -576,6 +642,93 @@ class SystemCommands:
         except Exception:
             return False
 
+    # ==================== РАБОТА ИЗ WINPE ====================
+
+    def get_winpe_drive_letter(self) -> str:
+        """
+        Определить букву диска Windows в среде WinPE
+        
+        Returns:
+            str: Буква диска (например, 'D:') или None
+        """
+        from .winpe_tools import get_windows_drive_letter
+        return get_windows_drive_letter()
+
+    def replace_sethc_winpe(self, target_exe: str = None) -> dict:
+        """
+        Заменить sethc.exe из среды WinPE
+        
+        Args:
+            target_exe: Путь к файлу для замены (по умолчанию cmd.exe)
+            
+        Returns:
+            dict: Результат операции {'success': bool, 'message': str, 'drive_letter': str}
+        """
+        from .winpe_tools import replace_sethc_winpe
+        return replace_sethc_winpe(target_exe)
+
+    def replace_utilman_winpe(self, target_exe: str = None) -> dict:
+        """
+        Заменить utilman.exe из среды WinPE
+        
+        Args:
+            target_exe: Путь к файлу для замены (по умолчанию cmd.exe)
+            
+        Returns:
+            dict: Результат операции {'success': bool, 'message': str, 'drive_letter': str}
+        """
+        from .winpe_tools import replace_utilman_winpe
+        return replace_utilman_winpe(target_exe)
+
+    def restore_sethc_winpe(self, modules_dir: str = None) -> dict:
+        """
+        Восстановить sethc.exe из среды WinPE
+        
+        Args:
+            modules_dir: Путь к папке modules с резервным файлом
+            
+        Returns:
+            dict: Результат операции
+        """
+        from .winpe_tools import restore_sethc_winpe
+        return restore_sethc_winpe(modules_dir)
+
+    def restore_utilman_winpe(self, modules_dir: str = None) -> dict:
+        """
+        Восстановить utilman.exe из среды WinPE
+        
+        Args:
+            modules_dir: Путь к папке modules с резервным файлом
+            
+        Returns:
+            dict: Результат операции
+        """
+        from .winpe_tools import restore_utilman_winpe
+        return restore_utilman_winpe(modules_dir)
+
+    def check_bitlocker_winpe(self, drive_letter: str = None) -> dict:
+        """
+        Проверить статус BitLocker в WinPE
+        
+        Args:
+            drive_letter: Буква диска для проверки
+            
+        Returns:
+            dict: Статус BitLocker
+        """
+        from .winpe_tools import check_bitlocker_status
+        return check_bitlocker_status(drive_letter)
+
+    def list_volumes_winpe(self) -> list:
+        """
+        Получить список всех томов в WinPE
+        
+        Returns:
+            list: Список томов с информацией
+        """
+        from .winpe_tools import list_volumes
+        return list_volumes()
+
 
 # Функции для быстрого доступа
 def restart_pc(timeout=5):
@@ -600,3 +753,13 @@ def disable_test_mode():
     """Выключить тестовый режим"""
     cmd = SystemCommands()
     return cmd.disable_test_mode()
+
+def remove_defender_winpe(self) -> dict:
+    """
+    Удалить Windows Defender из WinPE
+    
+    Returns:
+        dict: Результат операции
+    """
+    from .winpe_defender import remove_defender_winpe
+    return remove_defender_winpe()
