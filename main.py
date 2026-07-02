@@ -1204,85 +1204,95 @@ class DedHelperApp:
             messagebox.showerror("Ошибка", f"Не удалось определить диск:\n{e}")
 
     def _remove_windows_devender(self):
-        """Удалить Windows Defender (максимально приближено к оригинальному скрипту)"""
+        """Удалить ТОЛЬКО Windows Defender (без брандмауэра) из WinPE"""
         try:
-            from modules.winpe_defender import remove_defender_completely, find_windows_drive
-            
-            # Определяем диск
-            drive_letter = self.system_commands.get_winpe_drive_letter()
-            if not drive_letter:
-                drive_letter = find_windows_drive()
-            
-            msg = (
-                f"ВНИМАНИЕ! Будут уничтожены:\n"
-                f"  • Windows Defender\n"
-                f"  • Брандмауэр Windows\n"
-                f"  • Центр безопасности\n"
-                f"  • Все связанные службы и драйверы\n\n"
-                f"Диск: {drive_letter}\n\n"
-                f"Продолжить?"
+            from modules.winpe_defender import (
+                remove_defender_completely,
+                is_winpe_environment,
+                get_available_drives
             )
             
-            if not messagebox.askyesno("ПОДТВЕРЖДЕНИЕ", msg):
+            if not is_winpe_environment():
+                messagebox.showerror(
+                    "❌ ОШИБКА",
+                    "Вы не находитесь в среде WinPE!\n\n"
+                    "Функция удаления Windows Defender работает ТОЛЬКО из WinPE.\n\n"
+                    "Запустите DedHelper из WinPE\n"
+                )
                 return
             
-            # Запускаем удаление
-            self.status_var.set("Удаление Windows Defender...")
+            auto_detected = self.system_commands.get_winpe_drive_letter()
+            if not auto_detected:
+                auto_detected = "C:"
+            
+            drives = get_available_drives()
+            
+            drive_list = "\n".join([
+                f"  {d['letter']} {'✅ Windows' if d['is_windows'] else '📁 Диск'}"
+                for d in drives
+            ])
+            
+            if not drive_list:
+                drive_list = "  (нет доступных дисков)"
+            
+            msg = (
+                f"ВНИМАНИЕ! Будет удалён Windows Defender\n\n"
+                f"Будут удалены:\n"
+                f"  • Все файлы Windows Defender\n"
+                f"  • Службы Defender (WinDefend, WdNisSvc, Sense)\n"
+                f"  • Драйверы Defender\n"
+                f"  • Настройки реестра Defender\n\n"
+                f"✅ Брандмауэр и другие службы НЕ будут затронуты! Для корректной работы таких программ как zapret\n\n"
+                f"📋 Доступные диски:\n{drive_list}\n\n"
+                f"🔄 Автоматически определён диск: {auto_detected}\n\n"
+                f"Введите букву диска с Windows (например, D:) или оставьте пустым:"
+            )
+            
+            from tkinter import simpledialog
+            drive_input = simpledialog.askstring(
+                "ВЫБОР ДИСКА",
+                msg,
+                parent=self.root
+            )
+            
+            if drive_input and drive_input.strip():
+                drive_letter = drive_input.strip().upper()
+                if not drive_letter.endswith(':'):
+                    drive_letter += ':'
+            else:
+                drive_letter = auto_detected
+            
+            if not os.path.exists(drive_letter):
+                messagebox.showerror("❌ ОШИБКА", f"Диск {drive_letter} не существует!")
+                return
+            
+            self.status_var.set(f"🗑️ Удаление Windows Defender с диска {drive_letter}...")
             self.root.update()
             
             result = remove_defender_completely(drive_letter)
             
             if result['success']:
-                messagebox.showinfo("УСПЕХ", result['message'])
+                messagebox.showinfo("✅ УСПЕХ", result['message'])
                 logger.info(f"Windows Defender удалён: {result['details']}")
             else:
-                messagebox.showerror("ОШИБКА", result['message'])
+                messagebox.showerror("❌ ОШИБКА", result['message'])
                 logger.error(f"Ошибка удаления Defender: {result['message']}")
             
-            self.status_var.set("Готово")
+            if result.get('errors'):
+                error_details = "\n".join(result['errors'])
+                messagebox.showwarning(
+                    "⚠ Предупреждения",
+                    f"Были обнаружены следующие проблемы:\n\n{error_details}"
+                )
+            
+            self.status_var.set("✅ Готово")
             
         except ImportError as e:
             logger.error(f"Модуль winpe_defender не найден: {e}")
-            messagebox.showerror("Ошибка", "Модуль удаления Defender не найден")
+            messagebox.showerror("❌ Ошибка", "Модуль удаления Defender не найден")
         except Exception as e:
             logger.error(f"Ошибка удаления Defender: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось удалить Defender:\n{e}")
-
-    def _restore_windows_devender(self):
-        """Восстановить Windows Defender (через DISM)"""
-        try:
-            if not messagebox.askyesno("Подтверждение", 
-                "Восстановить Windows Defender?\n\n"
-                "Для этого будет использован DISM.\n"
-                "Потребуется перезагрузка."):
-                return
-            
-            self.status_var.set("Восстановление Windows Defender...")
-            self.root.update()
-            
-            ps_script = '''
-            Write-Output "Восстановление Windows Defender..."
-            
-            # Восстановление через DISM
-            dism /online /cleanup-image /restorehealth
-            
-            # Переустановка Defender
-            dism /online /add-capability /capabilityname:Microsoft.Windows.Sense.Client~~~~0.0.1.0
-            
-            Write-Output "Восстановление завершено"
-            '''
-            
-            result = run_hidden_powershell(ps_script)
-            
-            if result.returncode == 0:
-                messagebox.showinfo("Успех", "Восстановление Windows Defender запущено.\nПотребуется перезагрузка.")
-            else:
-                messagebox.showerror("Ошибка", "Не удалось восстановить Defender.")
-            
-            self.status_var.set("Готово")
-        except Exception as e:
-            logger.error(f"Ошибка восстановления Defender: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось восстановить Defender:\n{e}")
+            messagebox.showerror("❌ Ошибка", f"Не удалось удалить Defender:\n{e}")
 
     def _restore_windows_devender(self):
         """Восстановить Windows Defender (через DISM)"""

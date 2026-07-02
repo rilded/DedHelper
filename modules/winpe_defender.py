@@ -1,15 +1,13 @@
 """
-Модуль для удаления Windows Defender (адаптирован из репозитория rilded/removing-windows-devender)
-Оригинал: https://raw.githubusercontent.com/rilded/removing-windows-devender/refs/heads/main/удалениевиндовсдевендер.py
+Модуль для удаления ТОЛЬКО Windows Defender (без брандмауэра и других служб)
+Адаптирован из репозитория rilded/removing-windows-devender
 
-Адаптация для DedHelper:
-- Скрытый запуск команд (без окон)
-- Логирование через logger
-- Интеграция с интерфейсом программы
-- Определение системного диска в WinPE
-- Проверка запуска из WinPE
-- Ручной выбор диска
-- Подробный отчет о результате
+Изменения:
+- УДАЛЕНЫ записи реестра для брандмауэра (WindowsFirewall)
+- УДАЛЕНЫ записи для Центра безопасности (Security Center)
+- УДАЛЕНЫ службы MpsSvc, BFE, mpssvc (брандмауэр)
+- Оставлены ТОЛЬКО службы Defender: WinDefend, WdNisSvc, Sense, WdBoot, WdFilter, WdNisDrv
+- Оставлены ТОЛЬКО папки Defender
 """
 
 import os
@@ -18,6 +16,7 @@ import winreg
 import subprocess
 import logging
 import ctypes
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -34,22 +33,15 @@ def is_admin() -> bool:
 
 
 def is_winpe_environment() -> bool:
-    """
-    Проверить, запущена ли программа в среде WinPE
-    Проверяет наличие характерных признаков WinPE
-    """
+    """Проверить, запущена ли программа в среде WinPE"""
     try:
-        # Проверка 1: В WinPE нет папки ProgramData
         if not os.path.exists("C:\\ProgramData"):
-            logger.info("Обнаружен WinPE: отсутствует C:\\ProgramData")
             return True
-        
-        # Проверка 2: Проверка переменной окружения WinPE
         if os.environ.get("WinPE") == "1":
-            logger.info("Обнаружен WinPE: переменная WinPE=1")
+            return True
+        if os.path.exists("X:\\Windows\\System32\\winpeshl.exe"):
             return True
         
-        # Проверка 3: Проверка через WMI
         try:
             ps_script = '''
             try {
@@ -65,19 +57,12 @@ def is_winpe_environment() -> bool:
                 text=True
             )
             if "WINPE" in result.stdout:
-                logger.info("Обнаружен WinPE: через WMI")
                 return True
         except:
             pass
         
-        # Проверка 4: Проверка наличия файлов WinPE
-        if os.path.exists("X:\\Windows\\System32\\winpeshl.exe"):
-            logger.info("Обнаружен WinPE: X:\\Windows\\System32\\winpeshl.exe")
-            return True
-        
         return False
-    except Exception as e:
-        logger.warning(f"Ошибка проверки WinPE: {e}")
+    except:
         return False
 
 
@@ -111,28 +96,17 @@ def run_hidden_powershell(ps_command: str, capture_output: bool = True) -> subpr
 
 
 def find_windows_drive() -> str:
-    """
-    Автоматически определяет диск с Windows
-    Адаптировано из оригинального кода
-    """
+    """Автоматически определяет диск с Windows"""
     for drive in ["C:", "D:", "E:", "F:", "G:", "H:", "I:"]:
         if os.path.exists(f"{drive}\\Windows\\System32\\winload.exe"):
-            logger.info(f"Найден системный диск: {drive} (winload.exe)")
             return drive
         if os.path.exists(f"{drive}\\Windows\\System32\\winload.efi"):
-            logger.info(f"Найден системный диск: {drive} (winload.efi)")
             return drive
-    logger.warning("Системный диск не найден, используется C:")
     return "C:"
 
 
 def get_available_drives() -> list:
-    """
-    Получить список доступных дисков с признаками Windows
-    
-    Returns:
-        list: Список словарей с информацией о дисках
-    """
+    """Получить список доступных дисков с признаками Windows"""
     drives = []
     for letter in ["C:", "D:", "E:", "F:", "G:", "H:", "I:", "J:", "K:"]:
         try:
@@ -150,15 +124,107 @@ def get_available_drives() -> list:
     return drives
 
 
-def disable_defender_registry(drive: str) -> dict:
+def load_registry_hives(drive: str) -> dict:
+    """Загрузить кусты реестра с обработкой ошибок и повторными попытками"""
+    result = {'success': False, 'message': '', 'details': []}
+    
+    system_hive = f"{drive}\\Windows\\System32\\config\\SYSTEM"
+    software_hive = f"{drive}\\Windows\\System32\\config\\SOFTWARE"
+    
+    if not os.path.exists(system_hive):
+        result['message'] = f'Файл SYSTEM не найден: {system_hive}'
+        return result
+    
+    if not os.path.exists(software_hive):
+        result['message'] = f'Файл SOFTWARE не найден: {software_hive}'
+        return result
+    
+    run_hidden_command('reg unload HKLM\\OfflineSYSTEM', capture_output=True)
+    run_hidden_command('reg unload HKLM\\OfflineSOFTWARE', capture_output=True)
+    time.sleep(0.5)
+    
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            cmd_system = f'reg load HKLM\\OfflineSYSTEM "{system_hive}"'
+            result_system = run_hidden_command(cmd_system, capture_output=True)
+            
+            if result_system.returncode != 0:
+                error_msg = result_system.stderr.decode('cp866', errors='ignore') if result_system.stderr else "Неизвестная ошибка"
+                logger.warning(f"Попытка {attempt+1}: Ошибка загрузки SYSTEM: {error_msg}")
+                if "ACCESS DENIED" in error_msg.upper() or "5" in error_msg:
+                    take_ownership_file(system_hive)
+                    continue
+                continue
+            
+            cmd_software = f'reg load HKLM\\OfflineSOFTWARE "{software_hive}"'
+            result_software = run_hidden_command(cmd_software, capture_output=True)
+            
+            if result_software.returncode != 0:
+                error_msg = result_software.stderr.decode('cp866', errors='ignore') if result_software.stderr else "Неизвестная ошибка"
+                logger.warning(f"Попытка {attempt+1}: Ошибка загрузки SOFTWARE: {error_msg}")
+                if "ACCESS DENIED" in error_msg.upper() or "5" in error_msg:
+                    take_ownership_file(software_hive)
+                    continue
+                continue
+            
+            check_system = run_hidden_command('reg query HKLM\\OfflineSYSTEM', capture_output=True)
+            check_software = run_hidden_command('reg query HKLM\\OfflineSOFTWARE', capture_output=True)
+            
+            if check_system.returncode == 0 and check_software.returncode == 0:
+                result['success'] = True
+                result['message'] = 'Кусты реестра успешно загружены'
+                result['details'].append('✓ Кусты реестра загружены')
+                return result
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Попытка {attempt+1}: Ошибка: {e}")
+            time.sleep(1)
+    
+    result['message'] = 'Не удалось загрузить кусты реестра после нескольких попыток'
+    return result
+
+
+def take_ownership_file(filepath: str) -> bool:
+    """Взять ownership файла через PowerShell"""
+    try:
+        ps_script = f'''
+        $file = "{filepath}"
+        try {{
+            takeown /f "$file" /a 2>&1 | Out-Null
+            icacls "$file" /grant Administrators:F 2>&1 | Out-Null
+            Write-Output "OK"
+        }} catch {{
+            Write-Output "FAIL"
+        }}
+        '''
+        result = run_hidden_powershell(ps_script)
+        return "OK" in result.stdout if result.stdout else False
+    except:
+        return False
+
+
+def unload_registry_hives() -> bool:
+    """Выгрузить кусты реестра"""
+    try:
+        run_hidden_command('reg unload HKLM\\OfflineSYSTEM', capture_output=True)
+        run_hidden_command('reg unload HKLM\\OfflineSOFTWARE', capture_output=True)
+        return True
+    except:
+        return False
+
+
+def disable_defender_only_registry() -> dict:
     """
-    Полное отключение Defender и связанных компонентов в реестре
-    ТОЧНОЕ ВОСПРОИЗВЕДЕНИЕ оригинального кода
+    Отключение ТОЛЬКО Windows Defender в реестре
+    (БЕЗ брандмауэра и центра безопасности)
     """
-    logger.info("=== ОТКЛЮЧЕНИЕ ЧЕРЕЗ РЕЕСТР ===")
+    logger.info("=== ОТКЛЮЧЕНИЕ DEFENDER В РЕЕСТРЕ ===")
     results = {'success': False, 'count': 0, 'details': [], 'errors': []}
     
-    # ТОЧНО такие же записи, как в оригинале
+    # ТОЛЬКО записи для Defender (без Firewall и Security Center)
     reg_entries = [
         # Основные отключения Defender
         (r"SOFTWARE\Policies\Microsoft\Windows Defender", "DisableAntiSpyware", 1),
@@ -179,16 +245,6 @@ def disable_defender_registry(drive: str) -> dict:
         (r"SOFTWARE\Policies\Microsoft\Windows Defender\Scan", "DisableEmailScanning", 1),
         (r"SOFTWARE\Policies\Microsoft\Windows Defender\Scan", "DisableArchiveScanning", 1),
         
-        # Отключение Центра безопасности
-        (r"SOFTWARE\Policies\Microsoft\Windows Security Center\Svc", "AntiSpywareOverride", 1),
-        (r"SOFTWARE\Policies\Microsoft\Windows Security Center\Svc", "AntiVirusOverride", 1),
-        (r"SOFTWARE\Policies\Microsoft\Windows Security Center\Svc", "FirewallOverride", 1),
-        
-        # Отключение брандмауэра
-        (r"SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile", "EnableFirewall", 0),
-        (r"SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile", "EnableFirewall", 0),
-        (r"SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile", "EnableFirewall", 0),
-        
         # Отключение SmartScreen
         (r"SOFTWARE\Policies\Microsoft\Windows\System", "EnableSmartScreen", 0),
     ]
@@ -196,7 +252,6 @@ def disable_defender_registry(drive: str) -> dict:
     success_count = 0
     for reg_path, value_name, value_data in reg_entries:
         try:
-            # Определяем куст и путь (как в оригинале)
             if reg_path.startswith("SOFTWARE"):
                 hive = "OfflineSOFTWARE"
                 path = reg_path.replace("SOFTWARE\\", "")
@@ -223,27 +278,22 @@ def disable_defender_registry(drive: str) -> dict:
     return results
 
 
-def disable_security_services(drive: str) -> dict:
+def disable_defender_services_only() -> dict:
     """
-    Отключает все службы безопасности через реестр
-    ТОЧНОЕ ВОСПРОИЗВЕДЕНИЕ оригинального кода
+    Отключение ТОЛЬКО служб Defender
+    (БЕЗ брандмауэра: MpsSvc, BFE, mpssvc)
     """
-    logger.info("=== ОТКЛЮЧЕНИЕ СЛУЖБ ===")
+    logger.info("=== ОТКЛЮЧЕНИЕ СЛУЖБ DEFENDER ===")
     results = {'success': False, 'count': 0, 'details': [], 'errors': []}
     
-    # ТОЧНО такой же список служб, как в оригинале
+    # ТОЛЬКО службы Defender (без брандмауэра)
     services = [
-        "SecurityHealthService",
-        "wscsvc",      # Security Center
         "WinDefend",   # Windows Defender
         "WdNisSvc",    # Defender Network Inspection
-        "MpsSvc",      # Firewall
-        "BFE",         # Base Filtering Engine
         "Sense",       # Advanced Threat Protection
         "WdNisDrv",    # NIS Driver
         "WdBoot",      # Boot Driver
         "WdFilter",    # Filter Driver
-        "mpssvc",      # Windows Firewall
     ]
     
     success_services = []
@@ -266,41 +316,33 @@ def disable_security_services(drive: str) -> dict:
     
     results['count'] = len(success_services)
     results['success'] = results['count'] > 0
-    logger.info(f"Отключено {results['count']} служб")
+    logger.info(f"Отключено {results['count']} служб Defender")
     return results
 
 
-def delete_defender_files(drive: str) -> dict:
+def delete_defender_files_only(drive: str) -> dict:
     """
-    Удаляет все файлы Windows Defender и связанных компонентов
-    ТОЧНОЕ ВОСПРОИЗВЕДЕНИЕ оригинального кода
+    Удаление ТОЛЬКО файлов Defender
+    (БЕЗ SecurityCenter, Firewall, Security)
     """
-    logger.info("=== УДАЛЕНИЕ ФАЙЛОВ ===")
+    logger.info("=== УДАЛЕНИЕ ФАЙЛОВ DEFENDER ===")
     results = {'success': False, 'dirs': 0, 'files': 0, 'details': [], 'errors': []}
     
     windows_dir = f"{drive}\\Windows"
     system32_dir = f"{windows_dir}\\System32"
-    defender_dir = f"{system32_dir}\\Windows Defender"
     
-    # ТОЧНО такой же список папок, как в оригинале
+    # ТОЛЬКО папки Defender (без SecurityCenter, Firewall, Security)
     dirs_to_remove = [
-        defender_dir,
+        f"{system32_dir}\\Windows Defender",
         f"{system32_dir}\\Windows Defender Advanced Threat Protection",
         f"{system32_dir}\\Windows Defender Offline",
         f"{system32_dir}\\Windows Defender Update",
-        f"{system32_dir}\\SecurityCenter",
-        f"{system32_dir}\\Firewall",
-        f"{windows_dir}\\Security",
         f"{drive}\\ProgramData\\Microsoft\\Windows Defender",
-        f"{drive}\\ProgramData\\Microsoft\\Security Center",
-        f"{drive}\\ProgramData\\Microsoft\\Windows Security",
         f"{drive}\\Program Files\\Windows Defender",
-        f"{drive}\\Program Files\\Windows Security",
         f"{drive}\\Program Files (x86)\\Windows Defender",
-        f"{drive}\\Program Files (x86)\\Windows Security",
     ]
     
-    # ТОЧНО такой же список драйверов, как в оригинале
+    # ТОЛЬКО драйверы Defender
     driver_files = [
         "WdFilter.sys",
         "WdNisDrv.sys",
@@ -315,6 +357,12 @@ def delete_defender_files(drive: str) -> dict:
     for dir_path in dirs_to_remove:
         try:
             if os.path.exists(dir_path):
+                try:
+                    run_hidden_command(f'takeown /f "{dir_path}" /r /d y', capture_output=True)
+                    run_hidden_command(f'icacls "{dir_path}" /grant Administrators:F /t /q', capture_output=True)
+                except:
+                    pass
+                
                 shutil.rmtree(dir_path, ignore_errors=True)
                 logger.info(f"  ✓ Удалена папка: {dir_path}")
                 results['details'].append(f"✓ Удалена папка: {dir_path}")
@@ -333,6 +381,13 @@ def delete_defender_files(drive: str) -> dict:
         try:
             file_path = f"{drivers_path}\\{filename}"
             if os.path.exists(file_path):
+                try:
+                    run_hidden_command(f'takeown /f "{file_path}"', capture_output=True)
+                    run_hidden_command(f'icacls "{file_path}" /grant Administrators:F', capture_output=True)
+                    os.chmod(file_path, 0o777)
+                except:
+                    pass
+                
                 os.remove(file_path)
                 logger.info(f"  ✓ Удалён драйвер: {filename}")
                 results['details'].append(f"✓ Удалён драйвер: {filename}")
@@ -353,14 +408,7 @@ def delete_defender_files(drive: str) -> dict:
 
 def remove_defender_completely(drive_letter: str = None) -> dict:
     """
-    Полное удаление Windows Defender (основная функция)
-    Максимально приближена к оригинальному main()
-    
-    Args:
-        drive_letter: Буква диска с Windows (если None - определяется автоматически)
-        
-    Returns:
-        dict: Результат операции
+    Полное удаление ТОЛЬКО Windows Defender (без брандмауэра)
     """
     result = {
         'success': False,
@@ -375,32 +423,25 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
         }
     }
     
-    # Проверка прав администратора
     if not is_admin():
         result['message'] = '❌ Требуются права администратора!'
         result['errors'].append('Недостаточно прав')
         return result
     
-    # ПРОВЕРКА: Запущены ли мы из WinPE
     if not is_winpe_environment():
         result['message'] = (
             '❌ Вы не находитесь в среде WinPE!\n\n'
-            'Функции удаления Windows Defender работают ТОЛЬКО из WinPE.\n\n'
-            'Пожалуйста:\n'
-            '1. Загрузитесь с загрузочной флешки/диска\n'
-            '2. Запустите DedHelper из WinPE\n'
-            '3. Затем используйте эту функцию'
+            'Функция удаления Windows Defender работает ТОЛЬКО из WinPE.\n\n'
+            'Запустите DedHelper из WinPE\n'
         )
         result['errors'].append('Не WinPE среда')
         return result
     
-    # Определяем системный диск
     if drive_letter is None:
         drive_letter = find_windows_drive()
     
     result['drive'] = drive_letter
     
-    # Проверяем, что это действительно Windows
     if not os.path.exists(f"{drive_letter}\\Windows\\System32\\winload.exe") and \
        not os.path.exists(f"{drive_letter}\\Windows\\System32\\winload.efi"):
         result['message'] = f'❌ Windows не найдена на диске {drive_letter}!'
@@ -408,48 +449,36 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
         return result
     
     logger.info("=" * 60)
-    logger.info("     WINDOWS DEFENDER TOTAL KILLER - PE Edition")
+    logger.info("     УДАЛЕНИЕ ТОЛЬКО WINDOWS DEFENDER (PE Edition)")
     logger.info("=" * 60)
     logger.info(f"Найден системный диск: {drive_letter}")
-    logger.info(f"Windows: {drive_letter}\\Windows")
-    
-    system_hive = f"{drive_letter}\\Windows\\System32\\config\\SYSTEM"
-    software_hive = f"{drive_letter}\\Windows\\System32\\config\\SOFTWARE"
-    
-    if not os.path.exists(system_hive) or not os.path.exists(software_hive):
-        result['message'] = '❌ Кусты реестра не найдены!'
-        result['errors'].append('Кусты реестра не найдены')
-        return result
     
     # Загружаем кусты реестра
-    try:
-        run_hidden_command(f'reg load HKLM\\OfflineSYSTEM "{system_hive}"', capture_output=True)
-        run_hidden_command(f'reg load HKLM\\OfflineSOFTWARE "{software_hive}"', capture_output=True)
-        logger.info("✓ Кусты реестра загружены")
-        result['details'].append("✓ Кусты реестра загружены")
-    except Exception as e:
-        logger.error(f"✗ Ошибка загрузки реестра: {e}")
-        result['message'] = f'❌ Ошибка загрузки реестра: {e}'
-        result['errors'].append(f'Ошибка загрузки реестра: {e}')
+    load_result = load_registry_hives(drive_letter)
+    if not load_result['success']:
+        result['message'] = f'❌ {load_result["message"]}'
+        result['errors'].append(load_result['message'])
         return result
     
+    result['details'].extend(load_result['details'])
+    
     try:
-        # Шаг 1: Отключение через реестр
-        reg_result = disable_defender_registry(drive_letter)
+        # Шаг 1: Отключение через реестр (ТОЛЬКО Defender)
+        reg_result = disable_defender_only_registry()
         result['steps']['registry'] = reg_result
         result['details'].extend(reg_result['details'])
         if reg_result['errors']:
             result['errors'].extend(reg_result['errors'])
         
-        # Шаг 2: Отключение служб
-        svc_result = disable_security_services(drive_letter)
+        # Шаг 2: Отключение служб (ТОЛЬКО Defender)
+        svc_result = disable_defender_services_only()
         result['steps']['services'] = svc_result
         result['details'].extend(svc_result['details'])
         if svc_result['errors']:
             result['errors'].extend(svc_result['errors'])
         
-        # Шаг 3: Удаление файлов
-        file_result = delete_defender_files(drive_letter)
+        # Шаг 3: Удаление файлов (ТОЛЬКО Defender)
+        file_result = delete_defender_files_only(drive_letter)
         result['steps']['files'] = file_result
         result['details'].extend(file_result['details'])
         if file_result['errors']:
@@ -474,24 +503,23 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
         else:
             fail_count += 1
         
-        # Проверяем успех
         if success_count > 0:
             result['success'] = True
             
             if fail_count == 0:
                 result['message'] = (
-                    f"Windows Defender УСПЕШНО УДАЛЁН!\n\n"
+                    f"Windows Defender УСПЕШНО УДАЛЁН\n\n"
                     f"Результаты:\n"
                     f"  ✓ Отключено {reg_result['count']} параметров реестра\n"
-                    f"  ✓ Отключено {svc_result['count']} служб\n"
+                    f"  ✓ Отключено {svc_result['count']} служб Defender\n"
                     f"  ✓ Удалено {file_result['dirs']} папок и {file_result['files']} файлов\n\n"
                 )
             else:
                 result['message'] = (
-                    f"Windows Defender УДАЛЁН ЧАСТИЧНО\n\n"
+                    f"⚠ Windows Defender УДАЛЁН ЧАСТИЧНО\n\n"
                     f"Результаты:\n"
                     f"  ✓ Отключено {reg_result['count']} параметров реестра\n"
-                    f"  ✓ Отключено {svc_result['count']} служб\n"
+                    f"  ✓ Отключено {svc_result['count']} служб Defender\n"
                     f"  ✓ Удалено {file_result['dirs']} папок и {file_result['files']} файлов\n\n"
                     f"Некоторые операции не удалось выполнить:\n"
                     f"  • Реестр: {'✅' if reg_result['success'] else '❌'}\n"
@@ -500,13 +528,11 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
                 )
         else:
             result['message'] = (
-                f"НЕ УДАЛОСЬ УДАЛИТЬ Windows Defender!\n\n"
+                f"НЕ УДАЛОСЬ УДАЛИТЬ Windows Defender с диска {drive_letter}!\n\n"
                 f"Результаты:\n"
                 f"  ✗ Отключено {reg_result['count']} параметров реестра\n"
                 f"  ✗ Отключено {svc_result['count']} служб\n"
                 f"  ✗ Удалено {file_result['dirs']} папок и {file_result['files']} файлов\n\n"
-                f"Попробуйте:\n"
-                f"  • Запустить с другово диска"
             )
         
     except Exception as e:
@@ -514,13 +540,6 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
         result['message'] = f'❌ Критическая ошибка: {str(e)}'
         result['errors'].append(f'Критическая ошибка: {e}')
     finally:
-        # Выгружаем кусты
-        try:
-            run_hidden_command('reg unload HKLM\\OfflineSYSTEM', capture_output=True)
-            run_hidden_command('reg unload HKLM\\OfflineSOFTWARE', capture_output=True)
-            logger.info("✓ Кусты реестра выгружены")
-            result['details'].append("✓ Кусты реестра выгружены")
-        except Exception as e:
-            logger.warning(f"Ошибка выгрузки реестра: {e}")
+        unload_registry_hives()
     
     return result
