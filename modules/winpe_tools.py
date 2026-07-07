@@ -8,6 +8,8 @@
 import subprocess
 import os
 import logging
+import random
+import string
 
 # Константа для скрытия окна консоли
 CREATE_NO_WINDOW = 0x08000000
@@ -17,8 +19,6 @@ logger = logging.getLogger(__name__)
 
 def generate_random_name(length: int = 8) -> str:
     """Сгенерировать случайное имя для процесса"""
-    import random
-    import string
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
