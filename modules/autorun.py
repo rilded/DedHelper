@@ -1,6 +1,7 @@
 """
-Модуль управления автозагрузкой Windows
-Управление реестром, папкой автозагрузки, планировщиком задач и службами
+Модуль управления автозагрузкой Windows.
+Показываем только те места, куда реально прячутся вирусы.
+Службы/задачи — через PowerShell/UTF-8 (корректная кириллица).
 """
 
 import winreg
@@ -9,93 +10,186 @@ import subprocess
 import csv
 import io
 import logging
-from pathlib import Path
 
-# Настройка логирования
+CREATE_NO_WINDOW = 0x08000000
 logger = logging.getLogger(__name__)
 
 
 class AutorunManager:
-    """Класс для управления всеми типами автозагрузки Windows"""
-    
-    # Ключи реестра для автозагрузки
-    REGISTRY_KEYS = {
-        'HKCU_Run': (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run'),
-        'HKCU_RunOnce': (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\RunOnce'),
-        'HKLM_Run': (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Run'),
-        'HKLM_RunOnce': (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\RunOnce'),
-        'HKCU_Winlogon': (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'),
-        'HKLM_Winlogon': (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'),
-        'HKLM_AppInit': (winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows NT\CurrentVersion\Windows'),
-        'HKCU_CmdLine': (winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows NT\CurrentVersion\Winlogon'),
+    """Управление всеми типами автозагрузки Windows"""
+
+    # (location_id, hive, path, [значения] или None=все, view_flag)
+    # Winlogon показан точечно: Shell, Userinit, AppSetup, Taskman — там прячутся вирусы.
+    REGISTRY_LOCATIONS = [
+        ('HKCU_Run',            winreg.HKEY_CURRENT_USER,  r'Software\Microsoft\Windows\CurrentVersion\Run',       None, 0),
+        ('HKCU_RunOnce',        winreg.HKEY_CURRENT_USER,  r'Software\Microsoft\Windows\CurrentVersion\RunOnce',   None, 0),
+        ('HKLM_Run',            winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Run',       None, 0),
+        ('HKLM_RunOnce',        winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\RunOnce',   None, 0),
+        ('HKLM_Run_WOW64',      winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\Run',       None, winreg.KEY_WOW64_32KEY),
+        ('HKLM_RunOnce_WOW64',  winreg.HKEY_LOCAL_MACHINE, r'Software\Microsoft\Windows\CurrentVersion\RunOnce',   None, winreg.KEY_WOW64_32KEY),
+
+        # Winlogon — ТОЛЬКО опасные значения
+        ('Winlogon_Shell',      winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['Shell'],    0),
+        ('Winlogon_Userinit',   winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['Userinit'], 0),
+        ('Winlogon_AppSetup',   winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['AppSetup'], 0),
+        ('Winlogon_Taskman',    winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['Taskman'],  0),
+        ('Winlogon_HKCU_Shell',    winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['Shell'],    0),
+        ('Winlogon_HKCU_Userinit', winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon', ['Userinit'], 0),
+
+        # AppInit_DLLs — инжект DLL в каждый процесс
+        ('AppInit_DLLs_64',     winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', ['AppInit_DLLs'],     0),
+        ('AppInit_DLLs_32',     winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows', ['AppInit_DLLs'],     winreg.KEY_WOW64_32KEY),
+
+        # Explorer Run — альтернативный автозапуск
+        ('Explorer_Run_HKCU',   winreg.HKEY_CURRENT_USER,  r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run',  None, 0),
+        ('Explorer_Run_HKLM',   winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run',  None, 0),
+    ]
+
+    # Человеко-читаемые метки
+    LOCATION_LABELS = {
+        'HKCU_Run': 'HKCU\\Run',
+        'HKCU_RunOnce': 'HKCU\\RunOnce',
+        'HKLM_Run': 'HKLM\\Run',
+        'HKLM_RunOnce': 'HKLM\\RunOnce',
+        'HKLM_Run_WOW64': 'HKLM\\Run (32)',
+        'HKLM_RunOnce_WOW64': 'HKLM\\RunOnce (32)',
+        'Winlogon_Shell': 'Winlogon\\Shell',
+        'Winlogon_Userinit': 'Winlogon\\Userinit',
+        'Winlogon_AppSetup': 'Winlogon\\AppSetup',
+        'Winlogon_Taskman': 'Winlogon\\Taskman',
+        'Winlogon_HKCU_Shell': 'Winlogon(HKCU)\\Shell',
+        'Winlogon_HKCU_Userinit': 'Winlogon(HKCU)\\Userinit',
+        'AppInit_DLLs_64': 'AppInit_DLLs (64)',
+        'AppInit_DLLs_32': 'AppInit_DLLs (32)',
+        'Explorer_Run_HKCU': 'Policies\\Explorer\\Run (HKCU)',
+        'Explorer_Run_HKLM': 'Policies\\Explorer\\Run (HKLM)',
     }
-    
+
+    # Значения для Winlogon, которые нужно ВОССТАНОВИТЬ, а не удалять
+    WINLOGON_DEFAULTS = {
+        'Shell': 'explorer.exe',
+        'Userinit': r'C:\Windows\system32\userinit.exe,',
+    }
+
     def __init__(self):
         self.startup_folder = self._get_startup_folder()
-    
+
     def _get_startup_folder(self) -> str:
-        """Получить путь к папке автозагрузки"""
-        appdata = os.getenv('APPDATA')
-        if not appdata:
-            # Fallback для среды восстановления и других случаев, когда APPDATA не установлена
-            appdata = os.path.expanduser(r'~\AppData\Roaming')
-        return os.path.join(
-            appdata,
-            r'Microsoft\Windows\Start Menu\Programs\Startup'
-        )
-    
+        appdata = os.getenv('APPDATA') or os.path.expanduser(r'~\AppData\Roaming')
+        return os.path.join(appdata, r'Microsoft\Windows\Start Menu\Programs\Startup')
+
     # ==================== РЕЕСТР ====================
-    
-    def get_registry_autoruns(self) -> dict:
-        """Получить все элементы автозагрузки из реестра"""
-        result = {}
-        
-        for name, (hive, path) in self.REGISTRY_KEYS.items():
+
+    def get_registry_autoruns(self) -> list:
+        """
+        Все опасные записи автозагрузки.
+        Returns list[dict]: {'location', 'location_label', 'name', 'value', 'is_default'}
+        """
+        result = []
+        for loc_id, hive, path, value_filter, view_flag in self.REGISTRY_LOCATIONS:
             try:
-                key = winreg.OpenKey(hive, path, 0, winreg.KEY_READ)
-                values = {}
-                i = 0
-                while True:
-                    try:
-                        value_name, value_data, _ = winreg.EnumValue(key, i)
-                        values[value_name] = value_data
-                        i += 1
-                    except OSError:
-                        break
-                winreg.CloseKey(key)
-                if values:
-                    result[name] = values
+                access = winreg.KEY_READ | view_flag
+                try:
+                    key = winreg.OpenKey(hive, path, 0, access)
+                except OSError:
+                    continue
+
+                try:
+                    if value_filter is None:
+                        i = 0
+                        while True:
+                            try:
+                                value_name, value_data, _ = winreg.EnumValue(key, i)
+                                result.append({
+                                    'location': loc_id,
+                                    'location_label': self.LOCATION_LABELS.get(loc_id, loc_id),
+                                    'name': value_name,
+                                    'value': value_data,
+                                    'is_default': False,
+                                })
+                                i += 1
+                            except OSError:
+                                break
+                    else:
+                        for vname in value_filter:
+                            try:
+                                value_data, _ = winreg.QueryValueEx(key, vname)
+                                default = self.WINLOGON_DEFAULTS.get(vname)
+                                is_default = (default is not None and value_data == default)
+                                result.append({
+                                    'location': loc_id,
+                                    'location_label': self.LOCATION_LABELS.get(loc_id, loc_id),
+                                    'name': vname,
+                                    'value': value_data,
+                                    'is_default': is_default,
+                                })
+                            except OSError:
+                                pass
+                finally:
+                    winreg.CloseKey(key)
             except OSError:
-                result[name] = {'error': 'Нет доступа'}
-        
+                pass
         return result
-    
+
+    def _find_location(self, loc_id):
+        for entry in self.REGISTRY_LOCATIONS:
+            if entry[0] == loc_id:
+                return entry
+        return None
+
+    def remove_registry_autorun(self, name: str, location: str) -> bool:
+        """
+        Удалить запись автозагрузки.
+        Для Winlogon\\Shell / Userinit — ВОССТАНОВИТЬ дефолт (а не удалить).
+        """
+        entry = self._find_location(location)
+        if not entry:
+            return False
+        _, hive, path, _, view_flag = entry
+
+        # Winlogon Shell/Userinit — восстановить дефолт
+        if name in self.WINLOGON_DEFAULTS and location.startswith('Winlogon_'):
+            try:
+                key = winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE | view_flag)
+                try:
+                    winreg.SetValueEx(key, name, 0, winreg.REG_SZ, self.WINLOGON_DEFAULTS[name])
+                    return True
+                finally:
+                    winreg.CloseKey(key)
+            except OSError as e:
+                logger.error(f"Не удалось восстановить Winlogon\\{name}: {e}")
+                return False
+
+        # Обычное удаление
+        try:
+            key = winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE | view_flag)
+            try:
+                winreg.DeleteValue(key, name)
+                return True
+            finally:
+                winreg.CloseKey(key)
+        except OSError as e:
+            logger.error(f"Не удалось удалить {location}\\{name}: {e}")
+            return False
+
     def add_registry_autorun(self, name: str, path: str, location: str = 'HKCU_Run') -> bool:
-        """Добавить программу в автозагрузку через реестр"""
-        try:
-            hive, key_path = self.REGISTRY_KEYS.get(location, self.REGISTRY_KEYS['HKCU_Run'])
-            key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, f'"{path}"')
-            winreg.CloseKey(key)
-            return True
-        except Exception as e:
+        entry = self._find_location(location)
+        if not entry:
             return False
-    
-    def remove_registry_autorun(self, name: str, location: str = 'HKCU_Run') -> bool:
-        """Удалить программу из автозагрузки через реестр"""
+        _, hive, key_path, _, view_flag = entry
         try:
-            hive, key_path = self.REGISTRY_KEYS.get(location, self.REGISTRY_KEYS['HKCU_Run'])
-            key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_SET_VALUE)
-            winreg.DeleteValue(key, name)
-            winreg.CloseKey(key)
-            return True
-        except Exception as e:
+            key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_SET_VALUE | view_flag)
+            try:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, f'"{path}"')
+                return True
+            finally:
+                winreg.CloseKey(key)
+        except OSError:
             return False
-    
+
     # ==================== ПАПКА АВТОЗАГРУЗКИ ====================
-    
+
     def get_startup_folder_items(self) -> list:
-        """Получить элементы в папке автозагрузки"""
         items = []
         try:
             for item in os.listdir(self.startup_folder):
@@ -106,25 +200,26 @@ class AutorunManager:
         except Exception:
             pass
         return items
-    
+
     def add_to_startup(self, name: str, target_path: str) -> bool:
-        """Добавить ярлык в папку автозагрузки"""
         try:
             shortcut_path = os.path.join(self.startup_folder, f'{name}.lnk')
-            # Создаём ярлык через PowerShell
             ps_command = f'''
             $WScriptShell = New-Object -ComObject WScript.Shell
             $Shortcut = $WScriptShell.CreateShortcut("{shortcut_path}")
             $Shortcut.TargetPath = "{target_path}"
             $Shortcut.Save()
             '''
-            subprocess.run(['powershell', '-Command', ps_command], capture_output=True)
+            subprocess.run(
+                ['powershell', '-Command', ps_command],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            )
             return True
         except Exception:
             return False
-    
+
     def remove_from_startup(self, filename: str) -> bool:
-        """Удалить элемент из папки автозагрузки"""
         try:
             filepath = os.path.join(self.startup_folder, filename)
             if os.path.exists(filepath):
@@ -132,156 +227,146 @@ class AutorunManager:
             return True
         except Exception:
             return False
-    
+
     # ==================== ПЛАНИРОВЩИК ЗАДАЧ ====================
 
     def get_scheduled_tasks(self) -> list:
-        """Получить список задач планировщика"""
+        """Список задач. chcp 65001 для корректной кириллицы."""
         tasks = []
         try:
             result = subprocess.run(
-                ['schtasks', '/query', '/fo', 'CSV', '/nh'],
+                'chcp 65001 > nul && schtasks /query /fo CSV /nh',
+                shell=True,
                 capture_output=True,
                 text=True,
-                encoding='cp866',
-                errors='ignore'
+                encoding='utf-8',
+                errors='replace',
+                creationflags=CREATE_NO_WINDOW
             )
-            
-            # Используем csv модуль для корректного парсинга
-            csv_reader = csv.reader(io.StringIO(result.stdout))
-            lines = list(csv_reader)
-            
-            # Пропускаем заголовок (первая строка)
-            for line in lines[1:]:
-                if len(line) >= 2:
-                    task_name = line[0].strip()
-                    if task_name:  # Пропускаем пустые имена
+            reader = csv.reader(io.StringIO(result.stdout))
+            rows = list(reader)
+            for row in rows:
+                if len(row) >= 1:
+                    task_name = row[0].strip().lstrip('\ufeff')
+                    if task_name:
                         tasks.append({'name': task_name})
-                    else:
-                        logger.debug(f"Пропущена пустая задача: {line}")
-                        
         except Exception as e:
             logger.error(f"Ошибка получения задач планировщика: {e}")
-            
-        logger.info(f"Получено {len(tasks)} задач планировщика")
         return tasks
-    
+
     def create_scheduled_task(self, name: str, program: str, trigger: str = 'onlogon') -> bool:
-        """Создать задачу в планировщике"""
         try:
             cmd = f'schtasks /create /tn "{name}" /tr "{program}" /sc {trigger} /rl highest /f'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(cmd, shell=True, capture_output=True).returncode == 0
         except Exception:
             return False
-    
+
     def delete_scheduled_task(self, name: str) -> bool:
-        """Удалить задачу из планировщика"""
         try:
             cmd = f'schtasks /delete /tn "{name}" /f'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(cmd, shell=True, capture_output=True).returncode == 0
         except Exception:
             return False
-    
+
     def disable_scheduled_task(self, name: str) -> bool:
-        """Отключить задачу в планировщике"""
         try:
             cmd = f'schtasks /change /tn "{name}" /disable'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(cmd, shell=True, capture_output=True).returncode == 0
         except Exception:
             return False
-    
+
     def enable_scheduled_task(self, name: str) -> bool:
-        """Включить задачу в планировщике"""
         try:
             cmd = f'schtasks /change /tn "{name}" /enable'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(cmd, shell=True, capture_output=True).returncode == 0
         except Exception:
             return False
-    
-    # ==================== СЛУЖБЫ ====================
-    
+
+    # ==================== СЛУЖБЫ (через PowerShell) ====================
+
     def get_services(self) -> list:
-        """Получить список служб Windows"""
+        """Список служб. PowerShell + UTF-8 — корректная кириллица."""
         services = []
         try:
+            ps = (
+                '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; '
+                'Get-Service | Select-Object Name,DisplayName,Status | '
+                'ConvertTo-Csv -NoTypeInformation'
+            )
             result = subprocess.run(
-                ['sc', 'query', 'type=', 'service'],
+                ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
                 capture_output=True,
                 text=True,
-                encoding='cp866'
+                encoding='utf-8-sig',
+                errors='replace',
+                creationflags=CREATE_NO_WINDOW
             )
-            current_service = {}
-            for line in result.stdout.split('\n'):
-                if line.startswith('SERVICE_NAME:'):
-                    if current_service:
-                        services.append(current_service)
-                    current_service = {'name': line.split(':')[1].strip()}
-                elif 'DISPLAY_NAME:' in line:
-                    current_service['display_name'] = line.split(':')[1].strip()
-                elif 'STATE' in line:
-                    if 'RUNNING' in line:
-                        current_service['state'] = 'running'
-                    else:
-                        current_service['state'] = 'stopped'
-            if current_service:
-                services.append(current_service)
-        except Exception:
-            pass
+            reader = csv.reader(io.StringIO(result.stdout))
+            rows = list(reader)
+            for row in rows[1:]:  # пропускаем заголовок
+                if len(row) >= 3:
+                    services.append({
+                        'name': row[0].strip(),
+                        'display_name': row[1].strip(),
+                        'state': row[2].strip().lower(),
+                    })
+        except Exception as e:
+            logger.error(f"Ошибка получения служб: {e}")
         return services
-    
+
     def start_service(self, name: str) -> bool:
-        """Запустить службу"""
         try:
-            cmd = f'sc start "{name}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(
+                ['sc', 'start', name],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            ).returncode == 0
         except Exception:
             return False
-    
+
     def stop_service(self, name: str) -> bool:
-        """Остановить службу"""
         try:
-            cmd = f'sc stop "{name}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(
+                ['sc', 'stop', name],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            ).returncode == 0
         except Exception:
             return False
-    
+
     def delete_service(self, name: str) -> bool:
-        """Удалить службу"""
         try:
-            cmd = f'sc delete "{name}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(
+                ['sc', 'delete', name],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            ).returncode == 0
         except Exception:
             return False
-    
+
     def disable_service(self, name: str) -> bool:
-        """Отключить службу (установить тип запуска disabled)"""
         try:
-            cmd = f'sc config "{name}" start= disabled'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(
+                ['sc', 'config', name, 'start=', 'disabled'],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            ).returncode == 0
         except Exception:
             return False
-    
+
     def enable_service(self, name: str) -> bool:
-        """Включить службу (установить тип запуска auto)"""
         try:
-            cmd = f'sc config "{name}" start= auto'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return result.returncode == 0
+            return subprocess.run(
+                ['sc', 'config', name, 'start=', 'auto'],
+                capture_output=True,
+                creationflags=CREATE_NO_WINDOW
+            ).returncode == 0
         except Exception:
             return False
 
 
-# Функции для быстрого доступа
+# Функции быстрого доступа
 def get_all_autoruns():
-    """Получить всю автозагрузку"""
     manager = AutorunManager()
     return {
         'registry': manager.get_registry_autoruns(),
@@ -291,14 +376,11 @@ def get_all_autoruns():
 
 
 def remove_autorun(location: str, name: str) -> bool:
-    """Удалить элемент автозагрузки"""
     manager = AutorunManager()
-    
     if location == 'registry':
-        return manager.remove_registry_autorun(name)
+        return manager.remove_registry_autorun(name, 'HKCU_Run')
     elif location == 'startup':
         return manager.remove_from_startup(name)
     elif location == 'scheduler':
         return manager.delete_scheduled_task(name)
-    
     return False

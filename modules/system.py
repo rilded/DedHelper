@@ -155,25 +155,7 @@ class SystemCommands:
 
     def run_dialog(self) -> bool:
         """Открыть диалог запуска программ (Win+R)"""
-        try:
-            # Используем прямой вызов shell32.DllGetClassObject для открытия "Выполнить"
-            # Это более надёжный способ чем эмуляция клавиш
-            ps_command = '''
-            Add-Type -AssemblyName System.Windows.Forms
-            [System.Windows.Forms.SendKeys]::SendWait("{LWIN}r")
-            Start-Sleep -Milliseconds 100
-            '''
-            run_hidden_powershell(ps_command)
-            return True
-        except Exception as e:
-            # Альтернативный способ через запуск explorer с флагом
-            try:
-                subprocess.Popen('explorer.exe shell:::{2559a1f8-21d7-11d4-bdaf-00c04f60b9f0}')
-                return True
-            except Exception:
-                logger.error(f"Ошибка открытия Win+R: {e}")
-                return False
-            return False
+        subprocess.Popen("rundll32.exe shell32.dll,#61", shell=True)
     
     # ==================== ВОССТАНОВЛЕНИЕ СИСТЕМЫ ====================
     

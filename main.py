@@ -1,32 +1,26 @@
-"""
-DedHelper - Утилита для восстановления Windows после вирусов
-Версия 5.0 — как SimpleUnlocker но с уникальным дизайном
-
-Требования:
-- Python 3.8+
-- Windows 10/11
-- Права администратора
-- VC++ Redistributable (для Explorer++) - устанавливается автоматически при необходимости
-"""
-
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog
-import ctypes
 import sys
 import os
-import subprocess
-import shutil
+import ctypes
 import random
 import string
-import winreg
 import tempfile
+import shutil
 import logging
-from pathlib import Path
+import subprocess
+import winreg
 
-# Константа для скрытия окна консоли
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QMessageBox, QLineEdit, QTextEdit, QFrame, QGridLayout,
+    QFileDialog, QInputDialog, QHeaderView, QSplitter, QAbstractItemView,
+    QStyledItemDelegate, QStyle
+)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QIcon, QColor, QBrush, QPen
+
 CREATE_NO_WINDOW = 0x08000000
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -37,155 +31,121 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Глобальная переменная для хранения пути к копии Python
-_PYTHON_COPY_PATH = None
 
+# ==================== ХЕЛПЕРЫ ====================
 
 def generate_random_name(length: int = 8) -> str:
-    """Сгенерировать случайное имя для процесса"""
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
 
-def get_random_python_path() -> str:
-    """Получить путь к копии python.exe со случайным именем"""
-    global _PYTHON_COPY_PATH
-    
-    if _PYTHON_COPY_PATH and os.path.exists(_PYTHON_COPY_PATH):
-        return _PYTHON_COPY_PATH
-    
-    # Создаём временную папку для копии
-    temp_dir = tempfile.mkdtemp(prefix='PH_')
-    python_exe = sys.executable
-    random_name = generate_random_name(12) + '.exe'
-    python_copy = os.path.join(temp_dir, random_name)
-    
-    try:
-        shutil.copy2(python_exe, python_copy)
-        _PYTHON_COPY_PATH = python_copy
-        logger.debug(f"Создана копия Python: {python_copy}")
-    except Exception as e:
-        logger.error(f"Не удалось создать копию Python: {e}")
-        return sys.executable
-    
-    return python_copy
+def startupinfo_hide() -> subprocess.STARTUPINFO:
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return si
 
 
 def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.CompletedProcess:
-    """Выполнить команду без показа окна консоли"""
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-
     return subprocess.run(
-        cmd,
-        shell=True,
+        cmd, shell=True, capture_output=capture_output,
+        startupinfo=startupinfo_hide(), creationflags=CREATE_NO_WINDOW
+    )
+
+
+def run_hidden_powershell(ps_command: str, capture_output: bool = True) -> subprocess.CompletedProcess:
+    """Выполнить PowerShell без окна. Нужна для _take_registry_ownership."""
+    return subprocess.run(
+        ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
         capture_output=capture_output,
-        startupinfo=startupinfo,
+        startupinfo=startupinfo_hide(),
         creationflags=CREATE_NO_WINDOW
     )
 
 
-def run_hidden_powershell(ps_command: str, capture_output: bool = True, random_name: bool = True) -> subprocess.CompletedProcess:
-    """
-    Выполнить PowerShell команду без показа окна
-    
-    Args:
-        ps_command: Команда PowerShell для выполнения
-        capture_output: Захватывать ли вывод
-        random_name: Запускать ли с случайным именем процесса
-    """
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    
-    if random_name:
-        # Создаём копию powershell.exe со случайным именем
-        temp_dir = tempfile.mkdtemp(prefix='PS_')
-        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-        random_name = generate_random_name(12) + '.exe'
-        ps_copy = os.path.join(temp_dir, random_name)
-        
-        try:
-            shutil.copy2(ps_exe, ps_copy)
-            logger.debug(f"Создана копия PowerShell: {ps_copy}")
-        except Exception as e:
-            logger.error(f"Не удалось создать копию PowerShell: {e}")
-            ps_copy = ps_exe
-        
-        return subprocess.run(
-            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-            capture_output=capture_output,
-            startupinfo=startupinfo,
-            creationflags=CREATE_NO_WINDOW
-        )
-    else:
-        return subprocess.run(
-            ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-            capture_output=capture_output,
-            startupinfo=startupinfo,
-            creationflags=CREATE_NO_WINDOW
-        )
-
-
 def decode_output(stdout_bytes: bytes) -> str:
-    """
-    Декодировать вывод команды с обработкой ошибок кодировки
-    
-    Args:
-        stdout_bytes: Байты вывода команды
-        
-    Returns:
-        str: Декодированная строка
-    """
+    """Универсальное декодирование вывода (UTF-8 → cp866 → cp1251)."""
     if not stdout_bytes:
         return ""
-    
-    # Пробуем UTF-8, затем cp1251 (кириллица Windows), затем с заменой ошибок
-    for encoding in ['utf-8', 'cp1251', 'cp866']:
+    for enc in ('utf-8', 'cp866', 'cp1251'):
         try:
-            return stdout_bytes.decode(encoding)
-        except UnicodeDecodeError:
+            return stdout_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
             continue
-    
-    # Если ничего не подошло, декодируем с заменой некорректных символов
     return stdout_bytes.decode('utf-8', errors='replace')
 
 
-# Добавляем путь к модулям
+def relaunch_with_random_name() -> bool:
+    if os.environ.get('DEDHELPER_RELAUNCHED') == '1':
+        return False
+    if not getattr(sys, 'frozen', False):
+        return False
+    try:
+        current_exe = sys.executable
+        temp_dir = tempfile.mkdtemp(prefix='DH_')
+        random_name = generate_random_name(12) + '.exe'
+        new_exe_path = os.path.join(temp_dir, random_name)
+        shutil.copy2(current_exe, new_exe_path)
+
+        env = os.environ.copy()
+        env['DEDHELPER_RELAUNCHED'] = '1'
+        env['DEDHELPER_TEMP_DIR'] = temp_dir
+
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 1
+
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+        subprocess.Popen(
+            [new_exe_path], env=env, startupinfo=si,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            cwd=temp_dir, close_fds=True
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Ошибка перезапуска: {e}")
+        return False
+
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.autorun import AutorunManager
 from modules.restrictions import RestrictionsManager
 from modules.system import SystemCommands
-from modules.recovery import WinREManager
 from modules.processes import ProcessManager
 from modules.registry import RegistryEditor
-from modules.antigdi import AntiGDIManager, get_suspended_processes
 
 
-# Критические процессы
-CRITICAL_PROCESSES = [
-    'system', 'smss.exe', 'csrss.exe', 'wininit.exe',
-    'services.exe', 'lsass.exe', 'lsm.exe', 'svchost.exe',
-    'explorer.exe', 'winlogon.exe', 'spoolsv.exe', 'dwm.exe'
-]
+# ==================== ЦВЕТА ====================
 
-# === УНИКАЛЬНАЯ ЦВЕТОВАЯ СХЕМА ===
 COLORS = {
-    'bg_dark': '#1a1a2e',        # Тёмно-синий фон
-    'bg_medium': '#16213e',      # Средний фон
-    'bg_light': '#0f3460',       # Светлый фон
-    'accent': '#e94560',         # Акцентный красный
-    'accent_hover': '#ff6b6b',   # Акцент при наведении
-    'text_main': '#ffffff',      # Белый текст
-    'text_sec': '#a0a0a0',       # Серый текст
-    'success': '#00d26a',        # Зелёный успех
-    'warning': '#ffc107',        # Жёлтый warning
-    'critical': '#ff6b35',       # Оранжевый критический
-    'frozen': '#4ecdc4',         # Бирюзовый замороженный
+    'bg_dark': '#1a1a2e',
+    'bg_medium': '#16213e',
+    'bg_light': '#0f3460',
+    'accent': '#e94560',
+    'accent_hover': '#ff6b6b',
+    'text_main': '#ffffff',
+    'text_sec': '#a0a0a0',
+    'success': '#00d26a',
+    'warning': '#ffc107',
+    # Критические процессы — приглушённый оранжевый (не кислотный)
+    'critical': '#c97a1e',
+    'critical_fg': '#fff5e6',
+    'frozen': '#4ecdc4',
+    'default_ok': '#3a5a3a',
+    'border_soft':   'rgba(255, 255, 255, 0.35)',
+    'border_strong': 'rgba(255, 255, 255, 0.75)',
+    'gridline':      'rgba(255, 255, 255, 0.22)',
+    'row_border':    'rgba(255, 255, 255, 0.12)',
 }
 
+CRITICAL_PROCESS_NAMES = {
+    'system', 'registry', 'idle', 'memory compression', 'memcompression',
+    'secure system', 'smss.exe', 'csrss.exe', 'wininit.exe', 'services.exe',
+    'lsass.exe', 'winlogon.exe', 'fontdrvhost.exe',
+}
 
 def is_admin():
     return ctypes.windll.shell32.IsUserAnAdmin()
@@ -203,1492 +163,2085 @@ def run_as_admin():
     return True
 
 
-class DedHelperApp:
-    """Основной класс приложения с уникальным дизайном"""
+# ==================== КАСТОМНЫЕ ЭЛЕМЕНТЫ ====================
 
-    def __init__(self, root):
-        self.root = root
+class NumericTreeItem(QTreeWidgetItem):
+    """QTreeWidgetItem с числовой сортировкой PID (колонка 1)"""
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        if tree is not None and tree.sortColumn() == 1:
+            try:
+                return int(self.text(1)) < int(other.text(1))
+            except (ValueError, IndexError):
+                pass
+        return super().__lt__(other)
 
-        # Генерируем случайное имя для заголовка
+
+class ProcessItemDelegate(QStyledItemDelegate):
+    """
+    Отрисовывает фон/текст процесса из Qt::BackgroundRole / Qt::ForegroundRole.
+    Нужен потому, что QSS на QTreeWidget::item перекрывает BackgroundRole —
+    setBackground() сам по себе в стилизованном дереве не работает.
+    """
+
+    def paint(self, painter, option, index):
+        painter.save()
+        try:
+            selected = bool(option.state & QStyle.StateFlag.State_Selected)
+            hovered  = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+            bg = index.data(Qt.ItemDataRole.BackgroundRole)
+            fg = index.data(Qt.ItemDataRole.ForegroundRole)
+
+            # ---- Фон ----
+            if selected:
+                painter.fillRect(option.rect, QColor(COLORS['accent']))
+            elif bg is not None:
+                brush = bg if isinstance(bg, QBrush) else QBrush(bg)
+                painter.fillRect(option.rect, brush)
+            elif hovered:
+                painter.fillRect(option.rect, QColor(COLORS['bg_light']))
+            else:
+                # Зебра
+                if index.row() % 2 == 1:
+                    painter.fillRect(option.rect, QColor(COLORS['bg_light']))
+                else:
+                    painter.fillRect(option.rect, QColor(COLORS['bg_medium']))
+
+            # ---- Тонкая линия снизу ----
+            painter.setPen(QPen(QColor(255, 255, 255, 30), 1))
+            painter.drawLine(option.rect.bottomLeft(), option.rect.bottomRight())
+
+            # ---- Текст ----
+            text = index.data(Qt.ItemDataRole.DisplayRole)
+            if text is not None and str(text) != "":
+                if fg is not None:
+                    pen_color = fg.color() if isinstance(fg, QBrush) else QColor(fg)
+                    painter.setPen(pen_color)
+                else:
+                    painter.setPen(QColor(COLORS['text_main']))
+
+                font = index.data(Qt.ItemDataRole.FontRole)
+                if font is not None:
+                    painter.setFont(font)
+
+                rect = option.rect.adjusted(8, 0, -8, 0)
+                painter.drawText(
+                    rect,
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    str(text)
+                )
+        finally:
+            painter.restore()
+
+
+# ==================== ГЛАВНОЕ ОКНО ====================
+
+class DedHelperApp(QMainWindow):
+
+    REGISTRY_ROOTS = [
+        ('HKEY_CLASSES_ROOT', winreg.HKEY_CLASSES_ROOT),
+        ('HKEY_CURRENT_USER', winreg.HKEY_CURRENT_USER),
+        ('HKEY_LOCAL_MACHINE', winreg.HKEY_LOCAL_MACHINE),
+        ('HKEY_USERS', winreg.HKEY_USERS),
+        ('HKEY_CURRENT_CONFIG', winreg.HKEY_CURRENT_CONFIG),
+    ]
+
+    # Расширение -> (ProgID, команда открытия или None)
+    DEFAULT_ASSOCIATIONS = {
+        # Запускаемые файлы
+        '.exe': ('exefile', r'"%1" %*'),
+        '.com': ('comfile', r'"%1" %*'),
+        '.bat': ('batfile', r'"%1" %*'),
+        '.cmd': ('cmdfile', r'"%1" %*'),
+        '.scr': ('scrfile', r'"%1" /S'),
+        '.pif': ('piffile', r'"%1" %*'),
+        '.msi': ('Msi.Package', r'"%SystemRoot%\System32\msiexec.exe" /i "%1" %*'),
+        '.msp': ('Msi.Patch', r'"%SystemRoot%\System32\msiexec.exe" /p "%1" %*'),
+        # Системные
+        '.reg': ('regfile', r'regedit.exe "%1"'),
+        '.lnk': ('lnkfile', None),
+        '.url': ('InternetShortcut', None),
+        '.dll': ('dllfile', None),
+        '.sys': ('sysfile', None),
+        '.inf': ('inffile', r'%SystemRoot%\System32\notepad.exe %1'),
+        # Текст
+        '.txt': ('txtfile', r'%SystemRoot%\system32\NOTEPAD.EXE %1'),
+        '.log': ('txtfile', r'%SystemRoot%\system32\NOTEPAD.EXE %1'),
+        '.ini': ('txtfile', r'%SystemRoot%\system32\NOTEPAD.EXE %1'),
+        # Web
+        '.html': ('htmlfile', r'"%ProgramFiles%\Internet Explorer\iexplore.exe" %1'),
+        '.htm':  ('htmlfile', r'"%ProgramFiles%\Internet Explorer\iexplore.exe" %1'),
+        '.xml':  ('xmlfile', None),
+        # Архивы
+        '.zip': ('CompressedFolder', None),
+        '.cab': ('CABFolder', None),
+        # Скрипты
+        '.vbs': ('VBSFile', r'"%SystemRoot%\System32\WScript.exe" "%1" %*'),
+        '.js':  ('JSFile',  r'"%SystemRoot%\System32\WScript.exe" "%1" %*'),
+        '.jse': ('JSEFile', r'"%SystemRoot%\System32\WScript.exe" "%1" %*'),
+        '.wsf': ('WSFFile', r'"%SystemRoot%\System32\WScript.exe" "%1" %*'),
+        '.wsh': ('WSHFile', r'"%SystemRoot%\System32\WScript.exe" "%1" %*'),
+        # Изображения
+        '.jpg':  ('jpegfile', None),
+        '.jpeg': ('jpegfile', None),
+        '.png':  ('pngfile', None),
+        '.gif':  ('giffile', None),
+        '.bmp':  ('Paint.Picture', None),
+        '.ico':  ('icofile', None),
+    }
+
+    def __init__(self):
+        super().__init__()
         self.random_name = generate_random_name()
-        self.root.title(f"{self.random_name}")
-        
-        # Устанавливаем иконку окна
+        self.setWindowTitle(f"{self.random_name}")
+
         try:
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dedhelper.ico')
             if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
+                self.setWindowIcon(QIcon(icon_path))
         except Exception as e:
             logger.error(f"Ошибка установки иконки: {e}")
 
-        self.root.geometry("1100x800")
-        self.root.minsize(950, 700)
-        
-        # Применяем тёмную тему
-        self._apply_dark_theme()
-        
-        # Проверяем права администратора
+        self.resize(1100, 800)
+        self.setMinimumSize(950, 700)
         self.is_admin = is_admin()
-        
-        # Путь к Explorer++ (извлекаем во временную папку)
+
         self.temp_dir = tempfile.mkdtemp(prefix='DedHelper_')
         self.explorer_path = os.path.join(self.temp_dir, 'Explorer++.exe')
         self._extract_explorer()
 
-        # Путь к папке modules - корректно для EXE и для исходного кода
         if hasattr(sys, '_MEIPASS'):
             self.modules_dir = os.path.join(sys._MEIPASS, 'modules')
         else:
             self.modules_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules')
-        
-        logger.info(f"Modules directory: {self.modules_dir}")
 
-        # Менеджеры
         self.autorun_manager = AutorunManager()
         self.restrictions_manager = RestrictionsManager()
         self.system_commands = SystemCommands()
-        self.winre_manager = WinREManager()
         self.process_manager = ProcessManager()
         self.registry_editor = RegistryEditor()
 
-        # Отслеживание замороженных процессов
         self.frozen_pids = set()
 
-        # === Создаём status_var СРАЗУ ===
-        self.status_var = tk.StringVar()
-        admin_status = "Администратор" if self.is_admin else "Нет прав админа!"
-        self.status_var.set(admin_status)
+        self._apply_dark_theme()
+        self._create_ui()
+        QTimer.singleShot(1000, self._auto_detect_winpe_drive)
 
-        # Создаём интерфейс
-        self._create_header()
-        self._create_main_screen()
-        self._create_notebook()
-        self._create_status_bar()
+    # ==================== ТЕМА ====================
 
-        # Автоматическое определение диска Windows (для WinPE)
-        self.root.after(1000, self._auto_detect_winpe_drive)
-
-        # Обработчик закрытия окна
-        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
-
-        # Закрепляем окно (опционально)
-        # self.root.attributes('-topmost', True)
-
-    def _on_closing(self):
-        """Обработчик закрытия приложения - очистка ресурсов"""
-        try:
-            # Размораживаем все замороженные процессы
-            if self.frozen_pids:
-                logger.info(f"Размораживание {len(self.frozen_pids)} процессов перед закрытием")
-                for pid in self.frozen_pids:
-                    try:
-                        self.process_manager.resume_process(pid)
-                    except Exception as e:
-                        logger.warning(f"Не удалось разморозить процесс {pid}: {e}")
-
-            # Очищаем временную папку
-            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
-                try:
-                    shutil.rmtree(self.temp_dir)
-                    logger.info(f"Временная папка удалена: {self.temp_dir}")
-                except Exception as e:
-                    logger.warning(f"Не удалось удалить временную папку: {e}")
-
-            logger.info("Приложение закрыто")
-        except Exception as e:
-            logger.error(f"Ошибка при закрытии: {e}")
-        finally:
-            self.root.destroy()
-    
     def _apply_dark_theme(self):
-        """Применить уникальную тёмную тему"""
-        self.root.configure(bg=COLORS['bg_dark'])
-        
-        # Настраиваем стиль
-        style = ttk.Style()
-        
-        # Пробуем использовать тему clam как основу
-        try:
-            style.theme_use('clam')
-        except Exception:
-            pass
-        
-        # Настраиваем цвета элементов - ВСЕГДА тёмные
-        style.configure('TFrame', background=COLORS['bg_dark'])
-        style.configure('TLabel', background=COLORS['bg_dark'], foreground=COLORS['text_main'], font=('Segoe UI', 10))
-        style.configure('TButton', 
-                       background=COLORS['bg_light'], 
-                       foreground=COLORS['text_main'],
-                       font=('Segoe UI', 10, 'bold'),
-                       padding=10,
-                       relief='flat')
-        style.map('TButton',
-                 background=[('active', COLORS['accent']), ('pressed', COLORS['accent_hover'])])
-        
-        style.configure('TLabelFrame', 
-                       background=COLORS['bg_medium'], 
-                       foreground=COLORS['accent'],
-                       font=('Segoe UI', 11, 'bold'))
-        style.configure('TLabelFrame.Label', 
-                       background=COLORS['bg_medium'], 
-                       foreground=COLORS['accent'],
-                       font=('Segoe UI', 11, 'bold'))
-        
-        style.configure('Treeview',
-                       background=COLORS['bg_medium'],
-                       foreground=COLORS['text_main'],
-                       fieldbackground=COLORS['bg_medium'],
-                       font=('Segoe UI', 9),
-                       rowheight=25)
-        style.configure('Treeview.Heading',
-                       background=COLORS['bg_light'],
-                       foreground=COLORS['text_main'],
-                       font=('Segoe UI', 10, 'bold'))
-        style.map('Treeview',
-                 background=[('selected', COLORS['accent'])])
-        
-        style.configure('TNotebook', 
-                       background=COLORS['bg_dark'],
-                       tabmargins=[0, 0, 0, 0])
-        style.configure('TNotebook.Tab',
-                       background=COLORS['bg_light'],
-                       foreground=COLORS['text_main'],
-                       font=('Segoe UI', 10, 'bold'),
-                       padding=[15, 8])
-        style.map('TNotebook.Tab',
-                 background=[('selected', COLORS['accent'])])
-        
-        style.configure('TScrollbar',
-                       background=COLORS['bg_light'],
-                       troughcolor=COLORS['bg_dark'])
-        
-        style.configure('Horizontal.TProgressbar',
-                       background=COLORS['accent'],
-                       troughcolor=COLORS['bg_light'])
-    
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {COLORS['bg_dark']}; }}
+            QWidget {{
+                background-color: {COLORS['bg_dark']};
+                color: {COLORS['text_main']};
+                font-family: 'Segoe UI';
+                font-size: 10pt;
+            }}
+            QFrame {{ background-color: {COLORS['bg_medium']}; border-radius: 5px; }}
+
+            QPushButton {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_main']};
+                border: 1px solid {COLORS['border_soft']};
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 10pt;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['accent']};
+                border: 1px solid {COLORS['border_strong']};
+            }}
+            QPushButton:pressed {{
+                background-color: {COLORS['accent_hover']};
+                border: 1px solid #ffffff;
+            }}
+            QPushButton:focus {{
+                border: 1px solid #ffffff;
+            }}
+
+            QLabel {{ color: {COLORS['text_main']}; background-color: transparent; }}
+
+            QTabWidget::pane {{
+                background-color: {COLORS['bg_medium']};
+                border: 1px solid {COLORS['border_soft']};
+                border-radius: 5px;
+            }}
+            QTabBar::tab {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_main']};
+                padding: 10px 20px;
+                border: 1px solid {COLORS['border_soft']};
+                border-bottom: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                margin-right: 2px;
+                font-weight: bold;
+            }}
+            QTabBar::tab:selected {{
+                background-color: {COLORS['accent']};
+                border: 1px solid #ffffff;
+                border-bottom: none;
+            }}
+            QTabBar::tab:hover {{
+                background-color: {COLORS['accent_hover']};
+                border: 1px solid {COLORS['border_strong']};
+                border-bottom: none;
+            }}
+
+            QTreeWidget {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_main']};
+                border: 1px solid {COLORS['border_soft']};
+                border-radius: 5px;
+                alternate-background-color: {COLORS['bg_light']};
+                gridline-color: {COLORS['gridline']};
+            }}
+            QTreeWidget::item {{
+                padding: 5px;
+                border-bottom: 1px solid {COLORS['row_border']};
+            }}
+            QTreeWidget::item:selected {{
+                background-color: {COLORS['accent']};
+                border-bottom: 1px solid #ffffff;
+            }}
+            QTreeWidget::item:hover {{
+                background-color: {COLORS['bg_light']};
+                border-bottom: 1px solid {COLORS['border_soft']};
+            }}
+            QHeaderView::section {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_main']};
+                padding: 8px;
+                border: 1px solid {COLORS['border_soft']};
+                border-top: none;
+                font-weight: bold;
+            }}
+            QHeaderView::section:first {{ border-left: none; }}
+            QHeaderView::section:last  {{ border-right: none; }}
+
+            QLineEdit {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_main']};
+                border: 1px solid {COLORS['border_soft']};
+                border-radius: 5px;
+                padding: 8px;
+                font-family: 'Consolas';
+            }}
+            QLineEdit:hover {{ border: 1px solid {COLORS['border_strong']}; }}
+            QLineEdit:focus {{ border: 1px solid #ffffff; }}
+
+            QTextEdit {{
+                background-color: {COLORS['bg_medium']};
+                color: {COLORS['text_main']};
+                border: 1px solid {COLORS['border_soft']};
+                border-radius: 5px;
+                font-family: 'Consolas';
+            }}
+            QTextEdit:focus {{ border: 1px solid #ffffff; }}
+
+            QScrollBar:vertical {{
+                background-color: {COLORS['bg_dark']};
+                width: 12px; border-radius: 6px;
+                border: 1px solid {COLORS['border_soft']};
+            }}
+            QScrollBar::handle:vertical {{
+                background-color: {COLORS['bg_light']};
+                border-radius: 6px; min-height: 20px;
+                border: 1px solid {COLORS['border_soft']};
+            }}
+            QScrollBar::handle:vertical:hover {{ background-color: {COLORS['accent']}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+            QScrollBar:horizontal {{
+                background-color: {COLORS['bg_dark']};
+                height: 12px; border-radius: 6px;
+                border: 1px solid {COLORS['border_soft']};
+            }}
+            QScrollBar::handle:horizontal {{
+                background-color: {COLORS['bg_light']};
+                border-radius: 6px; min-width: 20px;
+                border: 1px solid {COLORS['border_soft']};
+            }}
+            QScrollBar::handle:horizontal:hover {{ background-color: {COLORS['accent']}; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
+
+            QMessageBox {{ background-color: {COLORS['bg_medium']}; }}
+            QMessageBox QLabel {{ color: {COLORS['text_main']}; }}
+            QMessageBox QPushButton {{ border: 1px solid {COLORS['border_soft']}; min-width: 80px; }}
+            QInputDialog {{ background-color: {COLORS['bg_medium']}; }}
+            QInputDialog QPushButton {{ border: 1px solid {COLORS['border_soft']}; min-width: 80px; }}
+            QSplitter::handle {{ background-color: {COLORS['bg_light']}; }}
+            QSplitter::handle:hover {{ background-color: {COLORS['accent']}; }}
+        """)
+
+    # ==================== UI ====================
+
     def _extract_explorer(self):
-        """Извлечь Explorer++ из встроенных ресурсов"""
         try:
-            # Пытаемся получить путь к временной папке PyInstaller
             if hasattr(sys, '_MEIPASS'):
-                # Программа запущена из EXE
                 source = os.path.join(sys._MEIPASS, 'modules', 'Explorer++.exe')
                 if os.path.exists(source):
                     shutil.copy2(source, self.explorer_path)
                     return
-            
-            # Пытаемся найти Explorer++ в исходной папке modules
-            source_paths = [
+            for source in (
                 os.path.join(os.path.dirname(__file__), 'modules', 'Explorer++.exe'),
                 os.path.join(os.getcwd(), 'modules', 'Explorer++.exe'),
-            ]
-
-            for source in source_paths:
+            ):
                 if os.path.exists(source):
                     shutil.copy2(source, self.explorer_path)
                     return
-
-            # Если не найдено, пробуем с рабочего стола (для отладки)
-            desktop_path = os.path.join(os.environ['USERPROFILE'], 'Desktop', 'експлорер', 'Explorer++.exe')
-            if os.path.exists(desktop_path):
-                shutil.copy2(desktop_path, self.explorer_path)
         except Exception as e:
-            print(f"Ошибка извлечения Explorer++: {e}")
+            logger.error(f"Ошибка извлечения Explorer++: {e}")
 
-    def _create_header(self):
-        """Создать красивый заголовок"""
-        header_frame = tk.Frame(self.root, bg=COLORS['bg_light'], height=60)
-        header_frame.pack(fill=tk.X, padx=0, pady=0)
-        header_frame.pack_propagate(False)
-        
-        # Логотип (текстовый) - без подзаголовка
-        logo_label = tk.Label(
-            header_frame,
-            text="DedHelper",
-            font=('Segoe UI', 24, 'bold'),
-            bg=COLORS['bg_light'],
-            fg=COLORS['accent']
-        )
-        logo_label.pack(side=tk.LEFT, padx=20, pady=15)
-        
-        # Статус админа справа
-        admin_label = tk.Label(
-            header_frame,
-            textvariable=self.status_var,
-            font=('Segoe UI', 9, 'bold'),
-            bg=COLORS['bg_light'],
-            fg=COLORS['success'] if self.is_admin else COLORS['warning']
-        )
-        admin_label.pack(side=tk.RIGHT, padx=20, pady=15)
-    
-    def _create_main_screen(self):
-        """Создать главный экран с красивыми кнопками"""
-        # Используем tk.Frame с явным цветом фона
-        main_frame = tk.Frame(self.root, bg=COLORS['bg_medium'])
-        main_frame.pack(fill=tk.X, padx=15, pady=15)
-        
-        # Заголовок секции
-        title_label = tk.Label(
-            main_frame,
-            text="Быстрое восстановление",
-            font=('Segoe UI', 11, 'bold'),
-            bg=COLORS['bg_medium'],
-            fg=COLORS['accent']
-        )
-        title_label.pack(anchor=tk.W, padx=10, pady=(0, 10))
-        
-        # Фрейм для сетки кнопок
-        buttons_frame = tk.Frame(main_frame, bg=COLORS['bg_medium'])
-        buttons_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        # Создаём сетку кнопок 3x3 (без смайликов)
+    def _create_ui(self):
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        self._create_header(main_layout)
+
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(15, 15, 15, 15)
+        content_layout.setSpacing(15)
+
+        self._create_main_screen(content_layout)
+        self._create_notebook(content_layout)
+
+        main_layout.addWidget(content_widget, 1)
+        self._create_status_bar()
+
+    def _create_header(self, parent_layout):
+        header_frame = QFrame()
+        header_frame.setFixedHeight(60)
+        header_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_light']};
+                border-radius: 0;
+                border-bottom: 1px solid {COLORS['border_soft']};
+            }}
+        """)
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(20, 0, 20, 0)
+
+        logo_label = QLabel("DedHelper")
+        logo_label.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 24px; font-weight: bold;
+            background-color: transparent; border: none;
+        """)
+        header_layout.addWidget(logo_label)
+        header_layout.addStretch()
+
+        admin_status = "Администратор" if self.is_admin else "Нет прав админа!"
+        admin_color = COLORS['success'] if self.is_admin else COLORS['warning']
+        self.admin_label = QLabel(admin_status)
+        self.admin_label.setStyleSheet(f"""
+            color: {admin_color};
+            font-size: 9pt; font-weight: bold;
+            background-color: transparent; border: none;
+            padding: 4px 10px;
+        """)
+        header_layout.addWidget(self.admin_label)
+        parent_layout.addWidget(header_frame)
+
+    def _create_main_screen(self, parent_layout):
+        main_frame = QFrame()
+        main_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_medium']};
+                border-radius: 10px;
+                border: 1px solid {COLORS['border_soft']};
+            }}
+        """)
+        main_layout = QVBoxLayout(main_frame)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+
+        title_label = QLabel("Быстрое восстановление")
+        title_label.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 11pt; font-weight: bold;
+            background-color: transparent; border: none;
+        """)
+        main_layout.addWidget(title_label)
+
+        buttons_grid = QGridLayout()
+        buttons_grid.setSpacing(10)
+
         buttons = [
             ("Восстановить шрифт", self._restore_font),
             ("Включить UAC", self._enable_uac),
             ("Войти в WinRE", self._enter_winre),
-            ("Очистить Hosts", self._clean_hosts),
             ("Снять ограничения", self._remove_all_restrictions),
             ("Очистить автозагрузку", self._clean_autorun),
             ("sfc /scannow", self._run_sfc),
             ("Восстановить ассоциации", self._restore_associations),
         ]
-        
+
         for i, (text, command) in enumerate(buttons):
             row = i // 3
             col = i % 3
-            
-            btn = tk.Button(
-                buttons_frame,
-                text=text,
-                command=command,
-                font=('Segoe UI', 10, 'bold'),
-                bg=COLORS['bg_light'],
-                fg=COLORS['text_main'],
-                activebackground=COLORS['accent'],
-                activeforeground=COLORS['text_main'],
-                relief='flat',
-                padx=15,
-                pady=12,
-                cursor='hand2',
-                width=22,
-                border=0
-            )
-            btn.grid(row=row, column=col, padx=8, pady=8)
-            
-            # Эффект при наведении
-            btn.bind('<Enter>', lambda e: e.widget.config(bg=COLORS['accent']))
-            btn.bind('<Leave>', lambda e: e.widget.config(bg=COLORS['bg_light']))
-        
-        # Разделитель
-        sep = tk.Frame(self.root, bg=COLORS['bg_light'], height=2)
-        sep.pack(fill=tk.X, padx=15, pady=10)
-    
-    def _create_notebook(self):
-        """Создать вкладки"""
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+            btn = QPushButton(text)
+            btn.setMinimumHeight(45)
+            btn.clicked.connect(command)
+            buttons_grid.addWidget(btn, row, col)
 
-        # Вкладки
-        tabs = [
-            ("Автозагрузка", self._create_autorun_tab),
-            ("Планировщик", self._create_scheduler_tab),
-            ("Ограничения", self._create_restrictions_tab),
-            ("Процессы", self._create_processes_tab),
-            ("Реестр", self._create_registry_tab),
-            ("Система", self._create_system_tab),
-            ("Проводник", self._create_explorer_tab),
+        main_layout.addLayout(buttons_grid)
+        parent_layout.addWidget(main_frame)
+
+    def _create_notebook(self, parent_layout):
+        self.notebook = QTabWidget()
+        parent_layout.addWidget(self.notebook, 1)
+
+        self._create_autorun_tab()
+        self._create_services_tab()
+        self._create_scheduler_tab()
+        self._create_restrictions_tab()
+        self._create_processes_tab()
+        self._create_registry_tab()
+        self._create_system_tab()
+        self._create_explorer_tab()
+
+    def _create_status_bar(self):
+        self.statusBar().setStyleSheet(f"""
+            QStatusBar {{
+                background-color: {COLORS['bg_light']};
+                color: {COLORS['text_main']};
+                padding: 5px;
+                border-top: 1px solid {COLORS['border_soft']};
+            }}
+        """)
+        self.statusBar().showMessage("Готово")
+
+    def _style_table(self, table: QTreeWidget):
+        """Совместимость; ничего не делает."""
+        pass
+
+    # ==================== БЫСТРЫЕ КНОПКИ ====================
+
+    def _restore_font(self):
+        """
+        Восстановление системного шрифта с обходом 'Отказано в доступе'.
+        Чистит FontSubstitutes + Fonts, берёт ownership, перезапускает кэш шрифтов.
+        """
+        if not self.is_admin:
+            QMessageBox.critical(self, "Ошибка", "Требуются права администратора!")
+            return
+
+        success = []
+        errors = []
+
+        targets = [
+            (winreg.HKEY_LOCAL_MACHINE,
+             r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes',
+             ['Segoe UI', 'Segoe UI Semibold', 'Segoe UI Light', 'Segoe UI Semilight',
+              'Microsoft Sans Serif', 'MS Shell Dlg', 'MS Shell Dlg 2',
+              'Tahoma', 'Arial', 'Helvetica', 'System', 'Fixedsys', 'Small Fonts']),
+            (winreg.HKEY_LOCAL_MACHINE,
+             r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts',
+             ['Segoe UI (TrueType)', 'Segoe UI Bold (TrueType)',
+              'Segoe UI Italic (TrueType)', 'Segoe UI Bold Italic (TrueType)',
+              'Segoe UI Semibold (TrueType)', 'Segoe UI Light (TrueType)',
+              'Segoe UI Semilight (TrueType)']),
         ]
 
-        for name, create_func in tabs:
-            frame = ttk.Frame(notebook)
-            notebook.add(frame, text=name)
-            create_func(frame)
-    
-    def _create_status_bar(self):
-        """Создать строку состояния"""
-        status_bar = tk.Frame(self.root, bg=COLORS['bg_light'], height=30)
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        status_bar.pack_propagate(False)
-        
-        status_label = tk.Label(
-            status_bar,
-            textvariable=self.status_var,
-            font=('Segoe UI', 9),
-            bg=COLORS['bg_light'],
-            fg=COLORS['text_main'],
-            padx=15
-        )
-        status_label.pack(side=tk.LEFT)
-        
-        # Версия справа
-        version_label = tk.Label(
-            status_bar,
-            text="DedHelper",
-            font=('Segoe UI', 9),
-            bg=COLORS['bg_light'],
-            fg=COLORS['text_sec'],
-            padx=15
-        )
-        version_label.pack(side=tk.RIGHT)
-    
-    # ==================== БЫСТРЫЕ КНОПКИ ====================
-    
-    def _restore_font(self):
-        if self.system_commands.restore_font_default():
-            messagebox.showinfo("Успех", "Системный шрифт восстановлен")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось восстановить шрифт")
-    
+        for hive, path, values in targets:
+            hive_str = 'HKLM' if hive == winreg.HKEY_LOCAL_MACHINE else 'HKCU'
+            try:
+                key = winreg.OpenKey(hive, path, 0, winreg.KEY_ALL_ACCESS)
+            except PermissionError:
+                logger.info(f"Access Denied на {path}, берём ownership...")
+                self._take_registry_ownership(hive_str, path)
+                try:
+                    key = winreg.OpenKey(hive, path, 0, winreg.KEY_ALL_ACCESS)
+                except OSError as e:
+                    errors.append(f"{path}: {e}")
+                    continue
+            except OSError as e:
+                logger.info(f"Ключ {path} отсутствует: {e}")
+                continue
+
+            try:
+                for vname in values:
+                    try:
+                        winreg.DeleteValue(key, vname)
+                        success.append(f"{path}\\{vname}")
+                    except FileNotFoundError:
+                        pass
+                    except OSError as e:
+                        try:
+                            r = run_hidden_command(
+                                f'reg delete "{hive_str}\\{path}" /v "{vname}" /f',
+                                capture_output=True
+                            )
+                            if r.returncode == 0:
+                                success.append(f"{path}\\{vname} (reg.exe)")
+                            else:
+                                errors.append(f"{path}\\{vname}: {e}")
+                        except Exception:
+                            errors.append(f"{path}\\{vname}: {e}")
+            finally:
+                winreg.CloseKey(key)
+
+        # Сброс пользовательских настроек шрифта в HKCU
+        try:
+            run_hidden_command(
+                'reg delete "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts" /f',
+                capture_output=True
+            )
+        except Exception:
+            pass
+
+        # Перезапуск службы кэша шрифтов
+        for svc in ('FontCache', 'FontCache3.0.0.0'):
+            try:
+                run_hidden_command(f'net stop {svc} /y', capture_output=True)
+                run_hidden_command(f'net start {svc}', capture_output=True)
+            except Exception:
+                pass
+
+        msg = f"Системный шрифт восстановлен\n\n Удалено значений: {len(success)}\n"
+        if errors:
+            msg += f"\nПредупреждения ({len(errors)}):\n  " + "\n  ".join(errors[:10])
+        msg += "\n\nРекомендуется перезагрузка."
+        QMessageBox.information(self, "Результат", msg)
+
     def _enable_uac(self):
         if self.system_commands.enable_uac():
-            messagebox.showinfo("Успех", "UAC включён\nТребуется перезагрузка")
+            QMessageBox.information(self, "Успех", "UAC включён. Требуется перезагрузка")
         else:
-            messagebox.showerror("Ошибка", "Не удалось включить UAC")
-    
+            QMessageBox.critical(self, "Ошибка", "Не удалось включить UAC")
+
     def _enter_winre(self):
-        # Для опытного пользователя - без лишних подтверждений
-        logger.info("Вход в WinRE")
         self.system_commands.enter_winre()
-    
-    def _clean_hosts(self):
-        if self.restrictions_manager.clean_hosts():
-            messagebox.showinfo("Успех", "Hosts файл очищен")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось очистить Hosts")
-    
+
     def _remove_all_restrictions(self):
-        # Для опытного пользователя - без подтверждения
         result = self.restrictions_manager.remove_all_restrictions()
-        msg = f"Результат снятия ограничений:\n\n"
-        msg += f"ScancodeMap: {'OK' if result['scancode_map'] else 'FAIL'}\n"
-        msg += f"Debuggers: {result['debuggers']} удалено\n"
-        msg += f"DisallowRun: {'OK' if result['disallow_run'] else 'FAIL'}\n"
-        msg += f"Hosts: {'OK' if result['hosts'] else 'FAIL'}\n"
-        msg += f"Group Policy: {result['group_policy']} политик удалено"
-        messagebox.showinfo("Результат", msg)
-    
+        msg = "Результат снятия ограничений:\n\n"
+        msg += f"ScancodeMap: {'удалён' if result['scancode_map'] else 'не найден'}\n"
+        msg += f"IFEO Debugger: удалено {result['debuggers']}\n"
+        msg += f"IFEO GlobalFlag: удалено {result['ifeo_global_flags']}\n"
+        msg += f"DisallowRun: {'снят' if result['disallow_run'] else 'не найден'}\n"
+        msg += f"Group Policy (Policies): очищено {result['group_policy']} веток\n"
+        msg += f"Winlogon\\Shell: {'исправлен' if result['winlogon_shell'] else 'в норме'}\n"
+        msg += f"Winlogon\\Userinit: {'исправлен' if result['winlogon_userinit'] else 'в норме'}\n"
+        msg += f"AppInit_DLLs: {'очищены' if result['appinit'] else 'в норме'}\n"
+        msg += f"SafeBoot\\AlternateShell: {'удалён' if result['safeboot'] else 'не найден'}\n"
+        msg += f"SpecialAccounts\\UserList: {'очищен' if result['special_accounts'] else 'не найден'}\n"
+        msg += "\nHOSTS-файл НЕ трогался."
+        QMessageBox.information(self, "Результат", msg)
+
     def _clean_autorun(self):
-        # Для опытного пользователя - без подтверждения
         removed = 0
-        registry_data = self.autorun_manager.get_registry_autoruns()
-        for location, values in registry_data.items():
-            if isinstance(values, dict) and 'error' not in values:
-                for name in values.keys():
-                    if self.autorun_manager.remove_registry_autorun(name, location):
-                        removed += 1
-        startup_items = self.autorun_manager.get_startup_folder_items()
-        for item in startup_items:
+        for entry in self.autorun_manager.get_registry_autoruns():
+            if self.autorun_manager.remove_registry_autorun(entry['name'], entry['location']):
+                removed += 1
+        for item in self.autorun_manager.get_startup_folder_items():
             if self.autorun_manager.remove_from_startup(item['name']):
                 removed += 1
-        messagebox.showinfo("Успех", f"Удалено элементов: {removed}")
-    
+        QMessageBox.information(self, "Успех", f"Удалено элементов: {removed}")
+
     def _run_sfc(self):
-        # Для опытного пользователя - без подтверждения
         self.system_commands.run_sfc()
-    
+
     def _disable_test_mode(self):
         if self.system_commands.disable_test_mode():
-            messagebox.showinfo("Успех", "Тестовый режим выключен\nТребуется перезагрузка")
+            QMessageBox.information(self, "Успех", "Тестовый режим выключен. Требуется перезагрузка")
         else:
-            messagebox.showerror("Ошибка", "Не удалось выключить тестовый режим")
-    
+            QMessageBox.critical(self, "Ошибка", "Не удалось выключить тестовый режим")
+
+    # ==================== ВОССТАНОВЛЕНИЕ АССОЦИАЦИЙ ====================
+
+    def _take_registry_ownership(self, hive_str: str, path: str) -> bool:
+        """Взять ownership ключа реестра через PowerShell Set-Acl."""
+        ps_script = (
+            f'$ErrorActionPreference = "SilentlyContinue"; '
+            f'$p = "{hive_str}:\\{path}"; '
+            f'try {{ '
+            f'  $acl = Get-Acl -Path $p; '
+            f'  $adm = New-Object System.Security.Principal.NTAccount("Administrators"); '
+            f'  $acl.SetOwner($adm); Set-Acl -Path $p -AclObject $acl; '
+            f'  $rule = New-Object System.Security.AccessControl.RegistryAccessRule($adm, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"); '
+            f'  $acl.ResetAccessRule($rule); Set-Acl -Path $p -AclObject $acl; '
+            f'  Write-Output "OK" '
+            f'}} catch {{ Write-Output "FAIL: $_" }}'
+        )
+        try:
+            result = run_hidden_powershell(ps_script, capture_output=True)
+            out = decode_output(result.stdout) if result.stdout else ""
+            ok = 'OK' in out
+            if not ok:
+                logger.warning(f"take_ownership {hive_str}\\{path}: {out}")
+            return ok
+        except Exception as e:
+            logger.error(f"take_ownership исключение: {e}")
+            return False
+
+    def _clear_user_choice_keys(self) -> int:
+        """Удалить UserChoice — без него Win10/11 игнорирует правки ассоциаций."""
+        removed = 0
+        base = r'Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts'
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_READ)
+        except OSError:
+            return 0
+
+        exts = []
+        try:
+            i = 0
+            while True:
+                try:
+                    exts.append(winreg.EnumKey(key, i))
+                    i += 1
+                except OSError:
+                    break
+        finally:
+            winreg.CloseKey(key)
+
+        for ext in exts:
+            sub = f'{base}\\{ext}'
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f'{sub}\\UserChoice')
+                removed += 1
+                continue
+            except OSError:
+                pass
+            try:
+                r = run_hidden_command(
+                    f'reg delete "HKCU\\{sub}\\UserChoice" /f', capture_output=True
+                )
+                if r.returncode == 0:
+                    removed += 1
+            except Exception:
+                pass
+        return removed
+
+    def _write_association_registry(self, ext: str, prog_id: str, command: str) -> bool:
+        """
+        Записать ассоциацию. Пробует winreg напрямую, при отказе — ownership + reg.exe.
+        Никогда не крашит — при любой ошибке возвращает False.
+        """
+        # --- 1) ext -> prog_id ---
+        ext_path = f'SOFTWARE\\Classes\\{ext}'
+        try:
+            k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, ext_path, 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(k, '', 0, winreg.REG_SZ, prog_id)
+            winreg.CloseKey(k)
+        except OSError:
+            # Может быть PermissionError — берём ownership
+            self._take_registry_ownership('HKLM', ext_path)
+            try:
+                k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, ext_path, 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(k, '', 0, winreg.REG_SZ, prog_id)
+                winreg.CloseKey(k)
+            except Exception:
+                # Финальный fallback через reg.exe
+                r = run_hidden_command(
+                    f'reg add "HKLM\\{ext_path}" /ve /t REG_SZ /d "{prog_id}" /f',
+                    capture_output=True
+                )
+                if r.returncode != 0:
+                    return False
+
+        # --- 2) command (если есть) ---
+        if command:
+            cmd_path = f'SOFTWARE\\Classes\\{prog_id}\\shell\\open\\command'
+            try:
+                k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, cmd_path, 0, winreg.KEY_SET_VALUE)
+                winreg.SetValueEx(k, '', 0, winreg.REG_EXPAND_SZ, command)
+                winreg.CloseKey(k)
+            except OSError:
+                self._take_registry_ownership('HKLM', cmd_path)
+                try:
+                    k = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, cmd_path, 0, winreg.KEY_SET_VALUE)
+                    winreg.SetValueEx(k, '', 0, winreg.REG_EXPAND_SZ, command)
+                    winreg.CloseKey(k)
+                except Exception:
+                    r = run_hidden_command(
+                        f'reg add "HKLM\\{cmd_path}" /ve /t REG_EXPAND_SZ /d "{command}" /f',
+                        capture_output=True
+                    )
+                    if r.returncode != 0:
+                        return False
+
+        return True
+
     def _restore_associations(self):
-        """Восстановить ассоциации файлов с предварительным бэкапом реестра"""
-        # Для опытного пользователя - без подтверждения
-        restored = 0
-        if self._fix_exe_association(): restored += 1
-        if self._fix_bat_association(): restored += 1
-        if self._fix_txt_association(): restored += 1
-        if self._fix_lnk_association(): restored += 1
-        if self._fix_html_association(): restored += 1
-        
-        logger.info(f"Восстановлено {restored} ассоциаций файлов")
-        messagebox.showinfo("Успех", f"Восстановлено ассоциаций: {restored}")
-    
-    def _fix_exe_association(self) -> bool:
-        """Восстановить ассоциацию .exe файлов"""
+        """Восстановление ассоциаций (аналог Simple Unlocker). Защищено try/except — не крашит."""
         try:
-            logger.debug("Восстановление ассоциации .exe")
-            try: winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r'Software\Classes\.exe')
-            except OSError: pass
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'.exe', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'exefile')
-            winreg.CloseKey(key)
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'exefile\shell\open\command', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, '"%1" %*')
-            winreg.CloseKey(key)
-            logger.info("Ассоциация .exe восстановлена")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка восстановления ассоциации .exe: {e}")
-            return False
+            if not self.is_admin:
+                QMessageBox.critical(self, "Ошибка", "Требуются права администратора!")
+                return
 
-    def _fix_bat_association(self) -> bool:
-        """Восстановить ассоциацию .bat файлов"""
-        try:
-            logger.debug("Восстановление ассоциации .bat")
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'.bat', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'batfile')
-            winreg.CloseKey(key)
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'batfile\shell\open\command', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, '"%1" %*')
-            winreg.CloseKey(key)
-            logger.info("Ассоциация .bat восстановлена")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка восстановления ассоциации .bat: {e}")
-            return False
+            self.statusBar().showMessage("Очистка UserChoice...")
+            QApplication.processEvents()
+            try:
+                user_choice_removed = self._clear_user_choice_keys()
+            except Exception as e:
+                logger.error(f"Ошибка очистки UserChoice: {e}")
+                user_choice_removed = 0
 
-    def _fix_txt_association(self) -> bool:
-        """Восстановить ассоциацию .txt файлов"""
-        try:
-            logger.debug("Восстановление ассоциации .txt")
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'.txt', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'txtfile')
-            winreg.CloseKey(key)
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'txtfile\shell\open\command', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'NOTEPAD.EXE "%1"')
-            winreg.CloseKey(key)
-            logger.info("Ассоциация .txt восстановлена")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка восстановления ассоциации .txt: {e}")
-            return False
+            restored = 0
+            failed = []
+            total = len(self.DEFAULT_ASSOCIATIONS)
 
-    def _fix_lnk_association(self) -> bool:
-        """Восстановить ассоциацию .lnk файлов"""
-        try:
-            logger.debug("Восстановление ассоциации .lnk")
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'.lnk', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'lnkfile')
-            winreg.CloseKey(key)
-            logger.info("Ассоциация .lnk восстановлена")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка восстановления ассоциации .lnk: {e}")
-            return False
+            for idx, (ext, (prog_id, command)) in enumerate(self.DEFAULT_ASSOCIATIONS.items(), 1):
+                self.statusBar().showMessage(f"Восстановление {ext} ({idx}/{total})...")
+                QApplication.processEvents()
+                try:
+                    if self._write_association_registry(ext, prog_id, command):
+                        restored += 1
+                    else:
+                        failed.append(ext)
+                except Exception as e:
+                    logger.error(f"Исключение при {ext}: {e}")
+                    failed.append(ext)
 
-    def _fix_html_association(self) -> bool:
-        """Восстановить ассоциацию .html файлов"""
-        try:
-            logger.debug("Восстановление ассоциации .html")
-            key = winreg.CreateKeyEx(winreg.HKEY_CLASSES_ROOT, r'.html', 0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'htmlfile')
-            winreg.CloseKey(key)
-            logger.info("Ассоциация .html восстановлена")
-            return True
+            # Дублируем через assoc/ftype
+            self.statusBar().showMessage("Применение через assoc/ftype...")
+            QApplication.processEvents()
+            for ext, (prog_id, command) in self.DEFAULT_ASSOCIATIONS.items():
+                try:
+                    run_hidden_command(f'assoc {ext}={prog_id}', capture_output=True)
+                    if command:
+                        run_hidden_command(f'ftype {prog_id}={command}', capture_output=True)
+                except Exception:
+                    pass
+
+            # Перезапуск explorer
+            try:
+                run_hidden_command('taskkill /f /im explorer.exe', capture_output=True)
+                subprocess.Popen('explorer.exe', shell=True)
+            except Exception:
+                pass
+
+            self.statusBar().showMessage("Готово")
+
+            msg = (
+                f"Восстановление ассоциаций завершено\n\n"
+                f"Удалено UserChoice: {user_choice_removed}\n"
+                f"Восстановлено ассоциаций: {restored} из {total}\n"
+            )
+            if failed:
+                msg += f"\nП Не удалось: " + ", ".join(failed[:15])
+                if len(failed) > 15:
+                    msg += f" ... ещё {len(failed) - 15}"
+            msg += "\n\nПроводник перезапущен."
+            QMessageBox.information(self, "Результат", msg)
+
         except Exception as e:
-            logger.error(f"Ошибка восстановления ассоциации .html: {e}")
-            return False
-    
-    # ==================== ВКЛАДКИ ====================
-    
-    def _create_autorun_tab(self, parent):
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Button(btn_frame, text="Обновить", command=self._refresh_autorun).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Удалить выбранное", command=self._remove_selected_autorun).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Удалить всё", command=self._remove_all_autorun).pack(side=tk.LEFT, padx=2)
-        
-        columns = ('Тип', 'Имя', 'Значение')
-        self.autorun_tree = ttk.Treeview(parent, columns=columns, show='tree headings', height=20)
-        self.autorun_tree.heading('#0', text='Расположение')
-        self.autorun_tree.heading('Тип', text='Тип')
-        self.autorun_tree.heading('Имя', text='Имя')
-        self.autorun_tree.heading('Значение', text='Значение')
-        self.autorun_tree.column('#0', width=180)
-        self.autorun_tree.column('Тип', width=80)
-        self.autorun_tree.column('Имя', width=150)
-        self.autorun_tree.column('Значение', width=400)
-        
-        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.autorun_tree.yview)
-        self.autorun_tree.configure(yscrollcommand=vsb.set)
-        self.autorun_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        
+            logger.exception("Критическая ошибка в _restore_associations")
+            QMessageBox.critical(self, "Ошибка", f"Критическая ошибка:\n{e}")
+
+    # ==================== ВКЛАДКА АВТОЗАГРУЗКА ====================
+
+    def _create_autorun_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.clicked.connect(self._refresh_autorun)
+        btn_layout.addWidget(refresh_btn)
+
+        remove_btn = QPushButton("Удалить выбранное")
+        remove_btn.clicked.connect(self._remove_selected_autorun)
+        btn_layout.addWidget(remove_btn)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.autorun_tree = QTreeWidget()
+        self.autorun_tree.setHeaderLabels(['Расположение', 'Имя', 'Значение'])
+        self.autorun_tree.setAlternatingRowColors(True)
+        self.autorun_tree.setRootIsDecorated(False)
+        self.autorun_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._style_table(self.autorun_tree)
+
+        header = self.autorun_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.autorun_tree.setColumnWidth(0, 180)
+        self.autorun_tree.setColumnWidth(1, 180)
+
+        layout.addWidget(self.autorun_tree)
+        self.notebook.addTab(widget, "Автозагрузка")
         self._refresh_autorun()
-    
+
     def _refresh_autorun(self):
         try:
-            for item in self.autorun_tree.get_children():
-                self.autorun_tree.delete(item)
-            registry_data = self.autorun_manager.get_registry_autoruns()
-            for location, values in registry_data.items():
-                if isinstance(values, dict) and 'error' not in values:
-                    for name, value in values.items():
-                        value_str = str(value)
-                        if len(value_str) > 100:
-                            value_str = value_str[:97] + "..."
-                        self.autorun_tree.insert('', 'end', text=location, values=('Реестр', name, value_str))
-            startup_items = self.autorun_manager.get_startup_folder_items()
-            for item in startup_items:
+            self.autorun_tree.clear()
+            for entry in self.autorun_manager.get_registry_autoruns():
+                value_str = str(entry['value'])
+                if len(value_str) > 120:
+                    value_str = value_str[:117] + "..."
+                item = QTreeWidgetItem([entry['location_label'], entry['name'], value_str])
+                item.setData(0, Qt.ItemDataRole.UserRole, entry['location'])
+                item.setData(0, Qt.ItemDataRole.UserRole + 1, entry['name'])
+                if entry.get('is_default'):
+                    for col in range(3):
+                        item.setBackground(col, QColor(COLORS['default_ok']))
+                self.autorun_tree.addTopLevelItem(item)
+
+            for item in self.autorun_manager.get_startup_folder_items():
                 path_str = item['path']
-                if len(path_str) > 100:
-                    path_str = path_str[:97] + "..."
-                self.autorun_tree.insert('', 'end', text='Startup', values=('Файл', item['name'], path_str))
-            self.status_var.set(f"Автозагрузка: {len(self.autorun_tree.get_children())} элементов")
+                if len(path_str) > 120:
+                    path_str = path_str[:117] + "..."
+                tree_item = QTreeWidgetItem(['Startup', item['name'], path_str])
+                tree_item.setData(0, Qt.ItemDataRole.UserRole, 'Startup')
+                tree_item.setData(0, Qt.ItemDataRole.UserRole + 1, item['name'])
+                self.autorun_tree.addTopLevelItem(tree_item)
+
+            self.statusBar().showMessage(
+                f"Автозагрузка: {self.autorun_tree.topLevelItemCount()} элементов"
+            )
         except Exception as e:
-            self.status_var.set(f"Ошибка: {e}")
-    
+            logger.error(f"Ошибка автозагрузки: {e}")
+            self.statusBar().showMessage(f"Ошибка: {e}")
+
     def _remove_selected_autorun(self):
-        selected = self.autorun_tree.selection()
+        selected = self.autorun_tree.selectedItems()
         if not selected:
-            messagebox.showwarning("Предупреждение", "Выберите элемент")
+            QMessageBox.warning(self, "Предупреждение", "Выберите элементы")
             return
-        if messagebox.askyesno("Подтверждение", "Удалить выбранный элемент?"):
-            for item in selected:
-                values = self.autorun_tree.item(item)['values']
-                if len(values) >= 2:
-                    name = values[1]
-                    location = self.autorun_tree.item(item)['text']
-                    if 'HK' in location or 'Run' in location:
-                        self.autorun_manager.remove_registry_autorun(name)
-                    elif 'Startup' in location:
-                        self.autorun_manager.remove_from_startup(name)
-            self._refresh_autorun()
-            messagebox.showinfo("Успех", "Элемент удалён")
-    
-    def _remove_all_autorun(self):
-        if messagebox.askyesno("Подтверждение", "Удалить ВСЮ автозагрузку?"):
-            self._clean_autorun()
-            self._refresh_autorun()
-    
-    def _create_scheduler_tab(self, parent):
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Button(btn_frame, text="Обновить", command=self._refresh_scheduler).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Удалить задачу", command=self._delete_task).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Отключить", command=self._disable_task).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Включить", command=self._enable_task).pack(side=tk.LEFT, padx=2)
-        
-        columns = ('Имя',)
-        self.scheduler_tree = ttk.Treeview(parent, columns=columns, show='tree headings', height=20)
-        self.scheduler_tree.heading('#0', text='Путь')
-        self.scheduler_tree.heading('Имя', text='Имя')
-        self.scheduler_tree.column('#0', width=400)
-        self.scheduler_tree.column('Имя', width=300)
-        
-        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.scheduler_tree.yview)
-        self.scheduler_tree.configure(yscrollcommand=vsb.set)
-        self.scheduler_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        
+        reply = QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить выбранные элементы? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        removed = 0
+        for item in selected:
+            location = item.data(0, Qt.ItemDataRole.UserRole)
+            name = item.data(0, Qt.ItemDataRole.UserRole + 1)
+            if location == 'Startup':
+                if self.autorun_manager.remove_from_startup(name):
+                    removed += 1
+            else:
+                if self.autorun_manager.remove_registry_autorun(name, location):
+                    removed += 1
+        self._refresh_autorun()
+        QMessageBox.information(self, "Успех", f"Удалено элементов: {removed}")
+
+    # ==================== ВКЛАДКА СЛУЖБЫ ====================
+
+    def _create_services_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        btn_layout = QHBoxLayout()
+        for text, slot in [
+            ("Обновить", self._refresh_services),
+            ("Запустить", self._start_services),
+            ("Остановить", self._stop_services),
+            ("Отключить", self._disable_services),
+            ("Включить", self._enable_services),
+            ("Удалить службу", self._delete_services),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            btn_layout.addWidget(b)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Фильтр:"))
+        self.services_filter = QLineEdit()
+        self.services_filter.setPlaceholderText("Поиск по имени или отображаемому имени...")
+        self.services_filter.textChanged.connect(self._filter_services)
+        filter_layout.addWidget(self.services_filter)
+        layout.addLayout(filter_layout)
+
+        self.services_tree = QTreeWidget()
+        self.services_tree.setHeaderLabels(['Имя', 'Отображаемое имя', 'Состояние'])
+        self.services_tree.setAlternatingRowColors(True)
+        self.services_tree.setRootIsDecorated(False)
+        self.services_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._style_table(self.services_tree)
+
+        header = self.services_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.services_tree.setColumnWidth(0, 220)
+        self.services_tree.setColumnWidth(2, 100)
+
+        layout.addWidget(self.services_tree)
+        self.notebook.addTab(widget, "Службы")
+        self._refresh_services()
+
+    def _refresh_services(self):
+        self.services_tree.clear()
+        try:
+            services = self.autorun_manager.get_services()
+        except Exception as e:
+            logger.error(f"Ошибка получения служб: {e}")
+            services = []
+        for svc in services:
+            state = svc.get('state', 'unknown')
+            item = QTreeWidgetItem([svc.get('name', ''), svc.get('display_name', ''), state])
+            item.setData(0, Qt.ItemDataRole.UserRole, svc.get('name', ''))
+            self.services_tree.addTopLevelItem(item)
+        self.statusBar().showMessage(f"Служб: {len(services)}")
+
+    def _filter_services(self, text: str):
+        text_lower = text.lower()
+        for i in range(self.services_tree.topLevelItemCount()):
+            item = self.services_tree.topLevelItem(i)
+            name = item.text(0).lower()
+            disp = item.text(1).lower()
+            item.setHidden(text_lower not in name and text_lower not in disp)
+
+    def _get_selected_service_names(self) -> list:
+        return [item.data(0, Qt.ItemDataRole.UserRole)
+                for item in self.services_tree.selectedItems()
+                if item.data(0, Qt.ItemDataRole.UserRole)]
+
+    def _start_services(self):
+        names = self._get_selected_service_names()
+        if not names:
+            QMessageBox.warning(self, "Предупреждение", "Выберите службы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение", f"Запустить {len(names)} служб(ы)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = sum(1 for n in names if self.autorun_manager.start_service(n))
+        self._refresh_services()
+        QMessageBox.information(self, "Результат", f"Запущено: {ok} из {len(names)}")
+
+    def _stop_services(self):
+        names = self._get_selected_service_names()
+        if not names:
+            QMessageBox.warning(self, "Предупреждение", "Выберите службы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение", f"Остановить {len(names)} служб(ы)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = sum(1 for n in names if self.autorun_manager.stop_service(n))
+        self._refresh_services()
+        QMessageBox.information(self, "Результат", f"Остановлено: {ok} из {len(names)}")
+
+    def _disable_services(self):
+        names = self._get_selected_service_names()
+        if not names:
+            QMessageBox.warning(self, "Предупреждение", "Выберите службы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение", f"Отключить {len(names)} служб(ы)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = sum(1 for n in names if self.autorun_manager.disable_service(n))
+        self._refresh_services()
+        QMessageBox.information(self, "Результат", f"Отключено: {ok} из {len(names)}")
+
+    def _enable_services(self):
+        names = self._get_selected_service_names()
+        if not names:
+            QMessageBox.warning(self, "Предупреждение", "Выберите службы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение", f"Включить {len(names)} служб(ы)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = sum(1 for n in names if self.autorun_manager.enable_service(n))
+        self._refresh_services()
+        QMessageBox.information(self, "Результат", f"Включено: {ok} из {len(names)}")
+
+    def _delete_services(self):
+        names = self._get_selected_service_names()
+        if not names:
+            QMessageBox.warning(self, "Предупреждение", "Выберите службы")
+            return
+        if QMessageBox.question(
+            self, "ПРЕДУПРЕЖДЕНИЕ",
+            f"УДАЛИТЬ {len(names)} служб(ы)?\n\nЭто необратимо!",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = sum(1 for n in names if self.autorun_manager.delete_service(n))
+        self._refresh_services()
+        QMessageBox.information(self, "Результат", f"Удалено: {ok} из {len(names)}")
+
+    # ==================== ВКЛАДКА ПЛАНИРОВЩИК ====================
+
+    def _create_scheduler_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        btn_layout = QHBoxLayout()
+        for text, slot in [
+            ("Обновить", self._refresh_scheduler),
+            ("Удалить задачу", self._delete_task),
+            ("Отключить", self._disable_task),
+            ("Включить", self._enable_task),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            btn_layout.addWidget(b)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.scheduler_tree = QTreeWidget()
+        self.scheduler_tree.setHeaderLabels(['Путь', 'Имя'])
+        self.scheduler_tree.setAlternatingRowColors(True)
+        self.scheduler_tree.setRootIsDecorated(False)
+        self.scheduler_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._style_table(self.scheduler_tree)
+        self.scheduler_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.scheduler_tree)
+
+        self.notebook.addTab(widget, "Планировщик")
         self._refresh_scheduler()
-    
+
     def _refresh_scheduler(self):
         try:
-            for item in self.scheduler_tree.get_children():
-                self.scheduler_tree.delete(item)
-            tasks = self.autorun_manager.get_scheduled_tasks()
-            for task in tasks[:100]:
-                self.scheduler_tree.insert('', 'end', text='Tasks', values=(task['name'],))
-        except Exception:
-            pass
-    
+            self.scheduler_tree.clear()
+            for task in self.autorun_manager.get_scheduled_tasks()[:200]:
+                item = QTreeWidgetItem(['Tasks', task['name']])
+                self.scheduler_tree.addTopLevelItem(item)
+        except Exception as e:
+            logger.error(f"Ошибка обновления планировщика: {e}")
+
     def _delete_task(self):
-        selected = self.scheduler_tree.selection()
+        selected = self.scheduler_tree.selectedItems()
         if not selected:
-            messagebox.showwarning("Предупреждение", "Выберите задачу")
+            QMessageBox.warning(self, "Предупреждение", "Выберите задачи")
             return
-        item = self.scheduler_tree.item(selected[0])
-        task_name = item['values'][0] if item['values'] else ''
-        if messagebox.askyesno("Подтверждение", f"Удалить задачу {task_name}?"):
-            if self.autorun_manager.delete_scheduled_task(task_name):
-                messagebox.showinfo("Успех", "Задача удалена")
-                self._refresh_scheduler()
-            else:
-                messagebox.showerror("Ошибка", "Не удалось удалить задачу")
-    
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить выбранные задачи? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        removed = sum(1 for item in selected
+                      if self.autorun_manager.delete_scheduled_task(item.text(1)))
+        self._refresh_scheduler()
+        QMessageBox.information(self, "Успех", f"Удалено задач: {removed}")
+
     def _disable_task(self):
-        selected = self.scheduler_tree.selection()
+        selected = self.scheduler_tree.selectedItems()
         if not selected:
-            messagebox.showwarning("Предупреждение", "Выберите задачу")
+            QMessageBox.warning(self, "Предупреждение", "Выберите задачи")
             return
-        item = self.scheduler_tree.item(selected[0])
-        task_name = item['values'][0] if item['values'] else ''
-        if self.autorun_manager.disable_scheduled_task(task_name):
-            messagebox.showinfo("Успех", "Задача отключена")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось отключить задачу")
-    
+        ok = sum(1 for item in selected
+                 if self.autorun_manager.disable_scheduled_task(item.text(1)))
+        QMessageBox.information(self, "Результат", f"Отключено: {ok} из {len(selected)}")
+
     def _enable_task(self):
-        selected = self.scheduler_tree.selection()
+        selected = self.scheduler_tree.selectedItems()
         if not selected:
-            messagebox.showwarning("Предупреждение", "Выберите задачу")
+            QMessageBox.warning(self, "Предупреждение", "Выберите задачи")
             return
-        item = self.scheduler_tree.item(selected[0])
-        task_name = item['values'][0] if item['values'] else ''
-        if self.autorun_manager.enable_scheduled_task(task_name):
-            messagebox.showinfo("Успех", "Задача включена")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось включить задачу")
-    
-    def _create_restrictions_tab(self, parent):
-        # Используем tk.Frame с явным цветом
-        btn_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        # Заголовок
-        title_label = tk.Label(
-            btn_frame,
-            text="Снятие ограничений",
-            font=('Segoe UI', 11, 'bold'),
-            bg=COLORS['bg_medium'],
-            fg=COLORS['accent']
-        )
-        title_label.grid(row=0, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W)
-        
-        ttk.Button(btn_frame, text="Снять ScancodeMap", command=self._remove_scancode).grid(row=1, column=0, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Удалить IFEO Debuggers", command=self._remove_debuggers).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Снять DisallowRun", command=self._remove_disallow_run).grid(row=1, column=2, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Очистить Hosts", command=self._clean_hosts_btn).grid(row=2, column=0, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Восстановить Hosts", command=self._restore_hosts).grid(row=2, column=1, padx=5, pady=5)
-        ttk.Button(btn_frame, text="Снять ВСЕ ограничения", command=self._remove_all_restrictions_btn).grid(row=2, column=2, padx=5, pady=5)
-    
+        ok = sum(1 for item in selected
+                 if self.autorun_manager.enable_scheduled_task(item.text(1)))
+        QMessageBox.information(self, "Результат", f"Включено: {ok} из {len(selected)}")
+
+    # ==================== ВКЛАДКА ОГРАНИЧЕНИЯ ====================
+
+    def _create_restrictions_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        title_label = QLabel("Снятие ограничений")
+        title_label.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 11pt; font-weight: bold;
+            background-color: transparent; border: none;
+        """)
+        layout.addWidget(title_label)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        buttons = [
+            ("Снять ScancodeMap", self._remove_scancode),
+            ("Удалить IFEO Debuggers", self._remove_debuggers),
+            ("Снять DisallowRun", self._remove_disallow_run),
+            ("Снять ВСЕ ограничения", self._remove_all_restrictions_btn),
+        ]
+        for i, (text, command) in enumerate(buttons):
+            row = i // 3
+            col = i % 3
+            btn = QPushButton(text)
+            btn.setMinimumHeight(40)
+            btn.clicked.connect(command)
+            grid.addWidget(btn, row, col)
+
+        layout.addLayout(grid)
+        layout.addStretch()
+        self.notebook.addTab(widget, "Ограничения")
+
     def _remove_scancode(self):
         if self.restrictions_manager.remove_scancode_map():
-            messagebox.showinfo("Успех", "ScancodeMap удалён")
+            QMessageBox.information(self, "Успех", "ScancodeMap удалён")
         else:
-            messagebox.showerror("Ошибка", "ScancodeMap не найден")
-    
+            QMessageBox.critical(self, "Ошибка", "ScancodeMap не найден")
+
     def _remove_debuggers(self):
         count = self.restrictions_manager.remove_all_debuggers()
-        messagebox.showinfo("Успех", f"Удалено записей IFEO: {count}")
-    
+        QMessageBox.information(self, "Успех", f"Удалено записей IFEO: {count}")
+
     def _remove_disallow_run(self):
         if self.restrictions_manager.remove_disallow_run():
-            messagebox.showinfo("Успех", "DisallowRun снят")
+            QMessageBox.information(self, "Успех", "DisallowRun снят")
         else:
-            messagebox.showerror("Ошибка", "DisallowRun не найден")
-    
-    def _clean_hosts_btn(self):
-        self._clean_hosts()
-    
-    def _restore_hosts(self):
-        if self.restrictions_manager.restore_hosts_default():
-            messagebox.showinfo("Успех", "Hosts файл восстановлен")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось восстановить Hosts")
-    
+            QMessageBox.critical(self, "Ошибка", "DisallowRun не найден")
+
     def _remove_all_restrictions_btn(self):
         self._remove_all_restrictions()
-    
-    def _create_processes_tab(self, parent):
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Button(btn_frame, text="Обновить", command=self._refresh_processes).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Завершить", command=self._terminate_process).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Заморозить", command=self._suspend_process).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Разморозить", command=self._resume_process).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Снять критический флаг", command=self._remove_critical_flag).pack(side=tk.LEFT, padx=2)
-        
-        columns = ('PID', 'Путь', 'CPU')
-        self.process_tree = ttk.Treeview(parent, columns=columns, show='tree headings', height=20)
-        self.process_tree.heading('#0', text='Имя процесса')
-        self.process_tree.heading('PID', text='PID')
-        self.process_tree.heading('Путь', text='Путь к файлу')
-        self.process_tree.heading('CPU', text='Нагрузка CPU')
-        self.process_tree.column('#0', width=150)
-        self.process_tree.column('PID', width=80)
-        self.process_tree.column('Путь', width=400)
-        self.process_tree.column('CPU', width=100)
-        
-        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.process_tree.yview)
-        self.process_tree.configure(yscrollcommand=vsb.set)
-        self.process_tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        
+
+    # ==================== ВКЛАДКА ПРОЦЕССЫ ====================
+
+    def _create_processes_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        btn_layout = QHBoxLayout()
+        for text, slot in [
+            ("Обновить", self._refresh_processes),
+            ("Завершить", self._terminate_process),
+            ("Заморозить", self._suspend_process),
+            ("Разморозить", self._resume_process),
+            ("Снять критический флаг", self._remove_critical_flag),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            btn_layout.addWidget(b)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        filter_layout = QHBoxLayout()
+        filter_layout.addWidget(QLabel("Фильтр:"))
+        self.process_filter = QLineEdit()
+        self.process_filter.setPlaceholderText("Поиск по имени, PID или пути...")
+        self.process_filter.textChanged.connect(self._filter_processes)
+        filter_layout.addWidget(self.process_filter)
+        layout.addLayout(filter_layout)
+
+        self.process_tree = QTreeWidget()
+        self.process_tree.setHeaderLabels(['Имя процесса', 'PID', 'Путь к файлу'])
+        self.process_tree.setAlternatingRowColors(False)   # зебру рисует делегат
+        self.process_tree.setRootIsDecorated(False)
+        self.process_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.process_tree.setSortingEnabled(True)
+        self.process_tree.setItemDelegate(ProcessItemDelegate(self.process_tree))
+        self._style_table(self.process_tree)
+
+        header = self.process_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.process_tree.setColumnWidth(0, 200)
+        self.process_tree.setColumnWidth(1, 70)
+
+        layout.addWidget(self.process_tree)
+        self.notebook.addTab(widget, "Процессы")
         self._refresh_processes()
-    
-    def _get_all_process_paths(self):
-        paths = {}
-        try:
-            ps_command = '''
-            Get-CimInstance Win32_Process | Select-Object ProcessId, ExecutablePath |
-            ForEach-Object { if ($_.ExecutablePath) { Write-Output "$($_.ProcessId)=$($_.ExecutablePath)" } }
-            '''
-            result = run_hidden_powershell(ps_command)
-            
-            # Декодируем вывод с обработкой ошибок кодировки
-            stdout = decode_output(result.stdout) if result.stdout else ""
-            
-            for line in stdout.strip().split('\n'):
-                if '=' in line:
-                    pid_str, path = line.split('=', 1)
-                    try:
-                        paths[int(pid_str)] = path
-                    except (ValueError, IndexError):
-                        pass
-        except Exception:
-            pass
-        return paths
-    
+
     def _refresh_processes(self):
-        for item in self.process_tree.get_children():
-            self.process_tree.delete(item)
-        
-        all_paths = self._get_all_process_paths()
-        processes = self.process_manager.get_processes()
-        
+        self.process_tree.setSortingEnabled(False)
+        self.process_tree.clear()
+
+        # Используем метод БЕЗ критичности — определяем сами
+        try:
+            processes = self.process_manager.get_processes_with_paths()
+        except Exception as e:
+            logger.error(f"Ошибка получения процессов: {e}")
+            processes = []
+
+        crit_bg = QColor('#c97a1e')
+        crit_fg = QColor('#fff5e6')
+        frozen_bg = QColor(COLORS['frozen'])
+        frozen_fg = QColor('#000000')
+
+        crit_count = 0
         for proc in processes:
-            name_lower = proc['name'].lower()
-            path = all_paths.get(proc['pid'], 'N/A')
-            cpu = "0%"
-            
-            tag = 'normal'
-            if name_lower in CRITICAL_PROCESSES:
-                tag = 'critical'
-            elif proc['pid'] in self.frozen_pids:
-                tag = 'frozen'
-            
-            self.process_tree.insert('', 'end', text=proc['name'], values=(proc['pid'], path, cpu), tags=(tag,))
-        
-        self.process_tree.tag_configure('critical', background=COLORS['critical'])
-        self.process_tree.tag_configure('frozen', background=COLORS['frozen'])
-        self.process_tree.tag_configure('normal', background=COLORS['bg_medium'])
-        
-        self.status_var.set(f"Процессов: {len(processes)}")
-    
-    def _get_selected_pid(self):
-        selected = self.process_tree.selection()
-        if selected:
-            item = self.process_tree.item(selected[0])
-            return int(item['values'][0])
-        return None
-    
+            name = proc['name']
+            pid = proc['pid']
+            path = proc.get('path', 'N/A')
+
+            # ОПРЕДЕЛЯЕМ КРИТИЧНОСТЬ ЗДЕСЬ — по имени и PID
+            is_critical = (
+                name.lower() in CRITICAL_PROCESS_NAMES
+                or pid in (0, 4)
+            )
+
+            if is_critical:
+                crit_count += 1
+            display_name = f"{name}" if is_critical else name
+
+            item = NumericTreeItem([display_name, str(pid), path])
+            item.setData(0, Qt.ItemDataRole.UserRole, pid)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, is_critical)
+
+            if is_critical:
+                for col in range(3):
+                    item.setBackground(col, crit_bg)
+                    item.setForeground(col, crit_fg)
+                    f = item.font(col)
+                    f.setBold(True)
+                    item.setFont(col, f)
+            elif pid in self.frozen_pids:
+                for col in range(3):
+                    item.setBackground(col, frozen_bg)
+                    item.setForeground(col, frozen_fg)
+
+            self.process_tree.addTopLevelItem(item)
+
+        self.process_tree.setSortingEnabled(True)
+        self.statusBar().showMessage(
+            f"Процессов: {len(processes)}  |  Критических: {crit_count}"
+        )
+
+    def _filter_processes(self, text: str):
+        text_lower = text.lower()
+        for i in range(self.process_tree.topLevelItemCount()):
+            item = self.process_tree.topLevelItem(i)
+            hidden = (text_lower not in item.text(0).lower()
+                      and text_lower not in item.text(1)
+                      and text_lower not in item.text(2).lower())
+            item.setHidden(hidden)
+
+    def _get_selected_pids(self) -> list:
+        result = []
+        for item in self.process_tree.selectedItems():
+            try:
+                result.append((int(item.text(1)), item.text(0)))
+            except (ValueError, IndexError):
+                pass
+        return result
+
     def _terminate_process(self):
-        pid = self._get_selected_pid()
-        if pid:
-            item = self.process_tree.item(self.process_tree.selection()[0])
-            name = item['text']
-            if name.lower() in CRITICAL_PROCESSES:
-                if not messagebox.askyesno("ПРЕДУПРЕЖДЕНИЕ", f"Завершить критический процесс {name}?"):
-                    return
-            if messagebox.askyesno("Подтверждение", f"Завершить процесс {name} (PID {pid})?"):
-                if self.process_manager.terminate_process(pid):
-                    messagebox.showinfo("Успех", "Процесс завершён")
-                    self.frozen_pids.discard(pid)
-                    self._refresh_processes()
-                else:
-                    messagebox.showerror("Ошибка", "Не удалось завершить процесс")
-    
+        selected = self._get_selected_pids()
+        if not selected:
+            QMessageBox.warning(self, "Предупреждение", "Выберите процессы")
+            return
+
+        critical_names = [item.text(0) for item in self.process_tree.selectedItems()
+                          if item.data(0, Qt.ItemDataRole.UserRole + 1)]
+
+        if critical_names:
+            preview = "\n".join(critical_names[:5])
+            if len(critical_names) > 5:
+                preview += f"\n... и ещё {len(critical_names) - 5}"
+            if QMessageBox.question(
+                self, "ПРЕДУПРЕЖДЕНИЕ",
+                f"Среди выбранных есть КРИТИЧЕСКИЕ процессы:\n\n{preview}\n\n"
+                f"Их завершение может привести к BSOD/перезагрузке.\nПродолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Завершить выбранные процессы? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        ok = 0
+        for pid, _ in selected:
+            if self.process_manager.terminate_process(pid):
+                self.frozen_pids.discard(pid)
+                ok += 1
+
+        self._refresh_processes()
+        QMessageBox.information(self, "Результат", f"Завершено: {ok} из {len(selected)}")
+
     def _suspend_process(self):
-        """Заморозить процесс с предупреждением о критических процессах"""
-        pid = self._get_selected_pid()
-        if pid:
-            item = self.process_tree.item(self.process_tree.selection()[0])
-            name = item['text']
-            
+        selected = self._get_selected_pids()
+        if not selected:
+            QMessageBox.warning(self, "Предупреждение", "Выберите процессы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Заморозить выбранные процессы? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = 0
+        for pid, _ in selected:
             if self.process_manager.suspend_process(pid):
                 self.frozen_pids.add(pid)
-                logger.info(f"Процесс {name} (PID {pid}) заморожен")
-                messagebox.showinfo("Успех", "Процесс заморожен")
-                self._refresh_processes()
-            else:
-                logger.error(f"Не удалось заморозить процесс {name} (PID {pid})")
-                messagebox.showerror("Ошибка", "Не удалось заморозить процесс")
-    
+                ok += 1
+        self._refresh_processes()
+        QMessageBox.information(self, "Результат", f"Заморожено: {ok} из {len(selected)}")
+
     def _resume_process(self):
-        pid = self._get_selected_pid()
-        if pid:
+        selected = self._get_selected_pids()
+        if not selected:
+            QMessageBox.warning(self, "Предупреждение", "Выберите процессы")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Разморозить выбранные процессы? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = 0
+        for pid, _ in selected:
             if self.process_manager.resume_process(pid):
                 self.frozen_pids.discard(pid)
-                messagebox.showinfo("Успех", "Процесс разморожен")
-                self._refresh_processes()
-            else:
-                messagebox.showerror("Ошибка", "Не удалось разморозить процесс")
-    
+                ok += 1
+        self._refresh_processes()
+        QMessageBox.information(self, "Результат", f"Разморожено: {ok} из {len(selected)}")
+
     def _remove_critical_flag(self):
-        pid = self._get_selected_pid()
-        if pid:
-            item = self.process_tree.item(self.process_tree.selection()[0])
-            name = item['text']
-            if messagebox.askyesno("Предупреждение", f"Снять критический флаг с {name}?"):
-                if self.process_manager.remove_critical_flag(pid):
-                    messagebox.showinfo("Успех", "Критический флаг снят")
-                    self._refresh_processes()
-                else:
-                    messagebox.showerror("Ошибка", "Не удалось снять флаг")
-    
-    def _create_registry_tab(self, parent):
-        # Используем tk.Frame с явным цветом
-        input_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
-        input_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        # Заголовок
-        title_label = tk.Label(
-            input_frame,
-            text="Работа с реестром",
-            font=('Segoe UI', 11, 'bold'),
-            bg=COLORS['bg_medium'],
-            fg=COLORS['accent']
-        )
-        title_label.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky=tk.W)
-        
-        ttk.Label(input_frame, text="Путь к ключу:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.registry_path_var = tk.StringVar(value="HKCU\\Software")
-        self.registry_path_entry = tk.Entry(input_frame, textvariable=self.registry_path_var, width=60,
-                                            bg=COLORS['bg_medium'], fg=COLORS['text_main'], 
-                                            insertbackground=COLORS['text_main'], relief='flat',
-                                            font=('Consolas', 10))
-        self.registry_path_entry.grid(row=1, column=1, padx=5, pady=5)
-        
-        ttk.Label(input_frame, text="Имя значения:").grid(row=2, column=0, padx=5, pady=5, sticky=tk.W)
-        self.registry_value_var = tk.StringVar()
-        self.registry_value_entry = tk.Entry(input_frame, textvariable=self.registry_value_var, width=60,
-                                             bg=COLORS['bg_medium'], fg=COLORS['text_main'],
-                                             insertbackground=COLORS['text_main'], relief='flat',
-                                             font=('Consolas', 10))
-        self.registry_value_entry.grid(row=2, column=1, padx=5, pady=5)
-        
-        ttk.Label(input_frame, text="Значение:").grid(row=3, column=0, padx=5, pady=5, sticky=tk.W)
-        self.registry_data_var = tk.StringVar()
-        self.registry_data_entry = tk.Entry(input_frame, textvariable=self.registry_data_var, width=60,
-                                            bg=COLORS['bg_medium'], fg=COLORS['text_main'],
-                                            insertbackground=COLORS['text_main'], relief='flat',
-                                            font=('Consolas', 10))
-        self.registry_data_entry.grid(row=3, column=1, padx=5, pady=5)
-        
-        btn_frame = tk.Frame(input_frame, bg=COLORS['bg_medium'])
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
-        
-        ttk.Button(btn_frame, text="Прочитать", command=self._read_registry).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Записать", command=self._write_registry).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Удалить", command=self._delete_registry).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="Открыть regedit", command=self._open_regedit).pack(side=tk.LEFT, padx=2)
-        
-        self.registry_output = scrolledtext.ScrolledText(parent, height=15, bg=COLORS['bg_medium'], fg=COLORS['text_main'], font=('Consolas', 9))
-        self.registry_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-    
-    def _read_registry(self):
-        path = self.registry_path_var.get()
-        value = self.registry_value_var.get()
-        result = self.registry_editor.read_key(path, value if value else None)
-        self.registry_output.delete(1.0, tk.END)
-        self.registry_output.insert(tk.END, f"Путь: {path}\n")
-        self.registry_output.insert(tk.END, f"Успех: {result['success']}\n")
-        if result['error']:
-            self.registry_output.insert(tk.END, f"Ошибка: {result['error']}\n")
-        self.registry_output.insert(tk.END, f"\nЗначение:\n{result['value']}")
-    
-    def _write_registry(self):
-        path = self.registry_path_var.get()
-        value_name = self.registry_value_var.get()
-        value_data = self.registry_data_var.get()
-        if not value_name:
-            messagebox.showwarning("Предупреждение", "Введите имя значения")
+        selected = self._get_selected_pids()
+        if not selected:
+            QMessageBox.warning(self, "Предупреждение", "Выберите процессы")
             return
-        if self.registry_editor.write_key(path, value_name, value_data):
-            messagebox.showinfo("Успех", "Значение записано")
-        else:
-            messagebox.showerror("Ошибка", "Не удалось записать значение")
-    
-    def _delete_registry(self):
-        path = self.registry_path_var.get()
-        value_name = self.registry_value_var.get()
-        if messagebox.askyesno("Подтверждение", f"Удалить {value_name} из {path}?"):
-            if self.registry_editor.delete_key(path, value_name if value_name else None):
-                messagebox.showinfo("Успех", "Удалено")
-            else:
-                messagebox.showerror("Ошибка", "Не удалось удалить")
-    
+        if QMessageBox.question(
+            self, "Предупреждение",
+            f"Снять критический флаг с выбранных процессов? ({len(selected)} шт.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        ok = 0
+        for pid, _ in selected:
+            if self.process_manager.remove_critical_flag(pid):
+                ok += 1
+        self._refresh_processes()
+        QMessageBox.information(self, "Результат", f"Снят флаг: {ok} из {len(selected)}")
+
+    # ==================== ВКЛАДКА РЕЕСТР ====================
+
+    def _create_registry_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.registry_tree = QTreeWidget()
+        self.registry_tree.setHeaderLabels(['Ключ'])
+        self.registry_tree.setRootIsDecorated(True)
+        self.registry_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.registry_tree.itemExpanded.connect(self._on_registry_key_expanded)
+        self.registry_tree.itemClicked.connect(self._on_registry_key_clicked)
+        self._style_table(self.registry_tree)
+        left_layout.addWidget(self.registry_tree)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.registry_values_tree = QTreeWidget()
+        self.registry_values_tree.setHeaderLabels(['Имя', 'Тип', 'Значение'])
+        self.registry_values_tree.setRootIsDecorated(False)
+        self._style_table(self.registry_values_tree)
+
+        vheader = self.registry_values_tree.header()
+        vheader.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        vheader.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        vheader.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.registry_values_tree.setColumnWidth(0, 200)
+        self.registry_values_tree.setColumnWidth(1, 130)
+
+        right_layout.addWidget(self.registry_values_tree)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([400, 600])
+        layout.addWidget(splitter)
+
+        btn_layout = QHBoxLayout()
+        for text, slot in [
+            ("Обновить", self._refresh_registry_root),
+            ("Создать ключ", self._create_registry_key),
+            ("Удалить ключ", self._delete_registry_key),
+            ("Добавить значение", self._add_registry_value),
+            ("Удалить значение", self._delete_registry_value),
+            ("Открыть regedit", self._open_regedit),
+        ]:
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            btn_layout.addWidget(b)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.notebook.addTab(widget, "Реестр")
+        self._refresh_registry_root()
+
+    def _refresh_registry_root(self):
+        self.registry_tree.clear()
+        self.registry_values_tree.clear()
+        for name, _ in self.REGISTRY_ROOTS:
+            item = QTreeWidgetItem([name])
+            item.setData(0, Qt.ItemDataRole.UserRole, name)
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+            item.addChild(QTreeWidgetItem(["Загрузка..."]))
+            self.registry_tree.addTopLevelItem(item)
+
+    def _on_registry_key_expanded(self, item: QTreeWidgetItem):
+        if item.data(0, Qt.ItemDataRole.UserRole + 1):
+            return
+        item.takeChildren()
+        hive_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not hive_path:
+            return
+        parts = hive_path.split('\\', 1)
+        root_name = parts[0]
+        sub_path = parts[1] if len(parts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            key = winreg.OpenKey(hive, sub_path, 0, winreg.KEY_READ)
+            i = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(key, i)
+                    child_path = f"{hive_path}\\{subkey_name}"
+                    child = QTreeWidgetItem([subkey_name])
+                    child.setData(0, Qt.ItemDataRole.UserRole, child_path)
+                    child.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+                    child.addChild(QTreeWidgetItem(["Загрузка..."]))
+                    item.addChild(child)
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+        except (PermissionError, Exception):
+            pass
+        item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
+
+    def _on_registry_key_clicked(self, item: QTreeWidgetItem, column: int):
+        self._load_registry_values(item)
+
+    def _load_registry_values(self, item: QTreeWidgetItem):
+        self.registry_values_tree.clear()
+        hive_path = item.data(0, Qt.ItemDataRole.UserRole)
+        if not hive_path:
+            return
+        parts = hive_path.split('\\', 1)
+        root_name = parts[0]
+        sub_path = parts[1] if len(parts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            key = winreg.OpenKey(hive, sub_path, 0, winreg.KEY_READ)
+            i = 0
+            while True:
+                try:
+                    vname, vdata, vtype = winreg.EnumValue(key, i)
+                    tname = self._get_registry_type_name(vtype)
+                    dname = "(По умолчанию)" if vname == '' else vname
+                    vstr = self._format_registry_value(vdata, vtype)
+                    vi = QTreeWidgetItem([dname, tname, vstr])
+                    vi.setData(0, Qt.ItemDataRole.UserRole, vname)
+                    self.registry_values_tree.addTopLevelItem(vi)
+                    i += 1
+                except OSError:
+                    break
+            winreg.CloseKey(key)
+        except PermissionError:
+            QMessageBox.warning(self, "Доступ запрещён", f"Нет прав на чтение {hive_path}")
+        except Exception:
+            pass
+
+    def _get_registry_type_name(self, value_type: int) -> str:
+        types = {
+            winreg.REG_SZ: 'REG_SZ',
+            winreg.REG_EXPAND_SZ: 'REG_EXPAND_SZ',
+            winreg.REG_BINARY: 'REG_BINARY',
+            winreg.REG_DWORD: 'REG_DWORD',
+            winreg.REG_MULTI_SZ: 'REG_MULTI_SZ',
+            winreg.REG_QWORD: 'REG_QWORD',
+        }
+        return types.get(value_type, f'UNKNOWN({value_type})')
+
+    def _format_registry_value(self, value, value_type: int) -> str:
+        if value_type == winreg.REG_BINARY:
+            if isinstance(value, bytes):
+                return ' '.join(f'{b:02X}' for b in value[:64]) + ('...' if len(value) > 64 else '')
+            return str(value)
+        elif value_type == winreg.REG_MULTI_SZ:
+            if isinstance(value, list):
+                return ' | '.join(str(v) for v in value)
+            return str(value)
+        elif value_type == winreg.REG_DWORD:
+            return f"0x{value:08X} ({value})"
+        elif value_type == winreg.REG_QWORD:
+            return f"0x{value:016X} ({value})"
+        return str(value)
+
+    def _get_selected_registry_path(self) -> str:
+        selected = self.registry_tree.selectedItems()
+        return selected[0].data(0, Qt.ItemDataRole.UserRole) if selected else None
+
+    def _create_registry_key(self):
+        parent_path = self._get_selected_registry_path()
+        if not parent_path:
+            QMessageBox.warning(self, "Предупреждение", "Выберите родительский ключ")
+            return
+        name, ok = QInputDialog.getText(self, "Создать ключ", "Имя нового ключа:")
+        if not ok or not name.strip():
+            return
+        new_path = f"{parent_path}\\{name.strip()}"
+        parts = new_path.split('\\', 1)
+        root_name = parts[0]
+        sub_path = parts[1] if len(parts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            key = winreg.CreateKeyEx(hive, sub_path, 0, winreg.KEY_ALL_ACCESS)
+            winreg.CloseKey(key)
+            QMessageBox.information(self, "Успех", "Ключ создан")
+            item = self.registry_tree.selectedItems()[0]
+            item.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+            item.setExpanded(False)
+            item.setExpanded(True)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось создать ключ:\n{e}")
+
+    def _delete_registry_key(self):
+        path = self._get_selected_registry_path()
+        if not path:
+            QMessageBox.warning(self, "Предупреждение", "Выберите ключ")
+            return
+        if path in [n for n, _ in self.REGISTRY_ROOTS]:
+            QMessageBox.warning(self, "Предупреждение", "Нельзя удалить корневой ключ")
+            return
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Удалить ключ:\n{path}\n\nЭто действие необратимо!",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        parts = path.rsplit('\\', 1)
+        if len(parts) != 2:
+            return
+        parent_path, key_name = parts
+        pparts = parent_path.split('\\', 1)
+        root_name = pparts[0]
+        sub_path = pparts[1] if len(pparts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            parent_key = winreg.OpenKey(hive, sub_path, 0, winreg.KEY_ALL_ACCESS)
+            winreg.DeleteKey(parent_key, key_name)
+            winreg.CloseKey(parent_key)
+            QMessageBox.information(self, "Успех", "Ключ удалён")
+            selected = self.registry_tree.selectedItems()[0]
+            parent = selected.parent()
+            if parent:
+                parent.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+                parent.setExpanded(False)
+                parent.setExpanded(True)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить ключ:\n{e}")
+
+    def _add_registry_value(self):
+        path = self._get_selected_registry_path()
+        if not path:
+            QMessageBox.warning(self, "Предупреждение", "Выберите ключ")
+            return
+        name, ok = QInputDialog.getText(self, "Добавить значение", "Имя значения:")
+        if not ok:
+            return
+        data, ok = QInputDialog.getText(self, "Добавить значение", "Данные (строка):")
+        if not ok:
+            return
+        parts = path.split('\\', 1)
+        root_name = parts[0]
+        sub_path = parts[1] if len(parts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            key = winreg.OpenKey(hive, sub_path, 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, data)
+            winreg.CloseKey(key)
+            QMessageBox.information(self, "Успех", "Значение добавлено")
+            self._load_registry_values(self.registry_tree.selectedItems()[0])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось добавить значение:\n{e}")
+
+    def _delete_registry_value(self):
+        path = self._get_selected_registry_path()
+        if not path:
+            QMessageBox.warning(self, "Предупреждение", "Выберите ключ")
+            return
+        selected_values = self.registry_values_tree.selectedItems()
+        if not selected_values:
+            QMessageBox.warning(self, "Предупреждение", "Выберите значение")
+            return
+        value_name = selected_values[0].data(0, Qt.ItemDataRole.UserRole)
+        parts = path.split('\\', 1)
+        root_name = parts[0]
+        sub_path = parts[1] if len(parts) > 1 else ''
+        hive = next((h for n, h in self.REGISTRY_ROOTS if n == root_name), None)
+        if hive is None:
+            return
+        try:
+            key = winreg.OpenKey(hive, sub_path, 0, winreg.KEY_SET_VALUE)
+            winreg.DeleteValue(key, value_name)
+            winreg.CloseKey(key)
+            QMessageBox.information(self, "Успех", "Значение удалено")
+            self._load_registry_values(self.registry_tree.selectedItems()[0])
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить значение:\n{e}")
+
     def _open_regedit(self):
         self.registry_editor.open_regedit()
 
-    
-    def _create_system_tab(self, parent):
-        # Создаём сетку фреймов с явными цветами
-        frames_config = [
-            ("Системные команды", [
-                ("Перезагрузка", self._restart_pc),
-                ("Выключение", self._shutdown_pc),
-                ("Выйти из пользователя", self._logout),
-                ("Войти в WinRE", self._enter_winre_sys),
-                ("Выполнить (Win+R)", self._run_dialog),
-            ]),
-            ("Восстановление", [
-                ("sfc /scannow", self._run_sfc_sys),
-                ("DISM Restore", self._run_dism),
-                ("Включить UAC", self._enable_uac_sys),
-                ("Выкл. тестовый режим", self._disable_test_mode_sys),
-                ("Восстановить шрифт", self._restore_font_sys),
-            ]),
-            ("WinPE", [
-                ("Определить диск", self._check_winpe_drive),
-                ("Заменить sethc", self._replace_sethc_winpe),
-                ("Заменить utilman", self._replace_utilman_winpe),
-                ("Восстановить sethc", self._restore_sethc_winpe),
-                ("Восстановить utilman", self._restore_utilman_winpe),
-                ("Удалить Windows Defender", self._remove_windows_devender),
-            ]),
-        ]
-        
-        for title, buttons in frames_config:
-            # Frame с явным цветом
-            frame = tk.Frame(parent, bg=COLORS['bg_medium'])
-            frame.pack(fill=tk.X, padx=10, pady=5)
-            
-            # Заголовок
-            title_label = tk.Label(
-                frame,
-                text=title,
-                font=('Segoe UI', 11, 'bold'),
-                bg=COLORS['bg_medium'],
-                fg=COLORS['accent']
-            )
-            title_label.pack(anchor=tk.W, padx=5, pady=(0, 5))
-            
-            btn_frame = tk.Frame(frame, bg=COLORS['bg_medium'])
-            btn_frame.pack(pady=5)
-            
-            for text, cmd in buttons:
-                ttk.Button(btn_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5, pady=3)
+    # ==================== ВКЛАДКА СИСТЕМА ====================
+
+    def _create_system_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        self._create_system_section(layout, "Системные команды", [
+            ("Перезагрузка", self._restart_pc),
+            ("Выключение", self._shutdown_pc),
+            ("Выйти из пользователя", self._logout),
+            ("Войти в WinRE", self._enter_winre_sys),
+            ("Выполнить (Win+R)", self._run_dialog),
+        ])
+        self._create_system_section(layout, "Восстановление", [
+            ("sfc /scannow", self._run_sfc_sys),
+            ("DISM Restore", self._run_dism),
+            ("Включить UAC", self._enable_uac_sys),
+            ("Выкл. тестовый режим", self._disable_test_mode_sys),
+            ("Восстановить шрифт", self._restore_font_sys),
+        ])
+        self._create_system_section(layout, "WinPE", [
+            ("Определить диск", self._check_winpe_drive),
+            ("Заменить sethc", self._replace_sethc_winpe),
+            ("Заменить utilman", self._replace_utilman_winpe),
+            ("Восстановить sethc", self._restore_sethc_winpe),
+            ("Восстановить utilman", self._restore_utilman_winpe),
+            ("Удалить Windows Defender", self._remove_windows_defender),
+        ])
+
+        layout.addStretch()
+        self.notebook.addTab(widget, "Система")
+
+    def _create_system_section(self, parent_layout, title, buttons):
+        frame = QFrame()
+        frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {COLORS['bg_medium']};
+                border-radius: 8px;
+                border: 1px solid {COLORS['border_soft']};
+                padding: 10px;
+            }}
+        """)
+        frame_layout = QVBoxLayout(frame)
+        title_label = QLabel(title)
+        title_label.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 11pt; font-weight: bold;
+            background-color: transparent; border: none;
+        """)
+        frame_layout.addWidget(title_label)
+
+        btn_layout = QHBoxLayout()
+        for text, command in buttons:
+            btn = QPushButton(text)
+            btn.clicked.connect(command)
+            btn_layout.addWidget(btn)
+        btn_layout.addStretch()
+        frame_layout.addLayout(btn_layout)
+        parent_layout.addWidget(frame)
 
     def _restart_pc(self):
-        if messagebox.askyesno("Подтверждение", "Перезагрузить ПК?"):
+        if QMessageBox.question(
+            self, "Подтверждение", "Перезагрузить ПК?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
             self.system_commands.restart_pc(5)
-            logger.info("Перезагрузка ПК")
 
     def _shutdown_pc(self):
-        if messagebox.askyesno("Подтверждение", "Выключить ПК?"):
+        if QMessageBox.question(
+            self, "Подтверждение", "Выключить ПК?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
             self.system_commands.shutdown_pc(5)
-            logger.info("Выключение ПК")
 
     def _logout(self):
-        if messagebox.askyesno("Подтверждение", "Выйти из пользователя?"):
+        if QMessageBox.question(
+            self, "Подтверждение", "Выйти из пользователя?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
             self.system_commands.logout()
-            logger.info("Выход из пользователя")
 
-    # Алиасы на основные методы (для вкладки Система)
-    _enter_winre_sys = _enter_winre
-    _run_sfc_sys = _run_sfc
-    _enable_uac_sys = _enable_uac
-    _disable_test_mode_sys = _disable_test_mode
-    _restore_font_sys = _restore_font
-
-    def _run_dialog(self):
-        self.system_commands.run_dialog()
-        logger.info("Запуск диалога выполнения (Win+R)")
+    def _enter_winre_sys(self): self._enter_winre()
+    def _run_sfc_sys(self): self._run_sfc()
+    def _enable_uac_sys(self): self._enable_uac()
+    def _disable_test_mode_sys(self): self._disable_test_mode()
+    def _restore_font_sys(self): self._restore_font()
+    def _run_dialog(self): self.system_commands.run_dialog()
 
     def _run_dism(self):
-        if messagebox.askyesno("Подтверждение", "Запустить DISM?"):
+        if QMessageBox.question(
+            self, "Подтверждение", "Запустить DISM?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
             self.system_commands.run_dism()
-            logger.info("Запуск DISM")
 
-    # ==================== WINPE ФУНКЦИИ ====================
+    # ==================== WINPE ====================
+
     def _check_winpe_drive(self):
-        """Определить диск Windows и показать информацию"""
         try:
             drive_letter = self.system_commands.get_winpe_drive_letter()
             if drive_letter:
-                system32_path = f"{drive_letter}\\Windows\\System32"
-                msg = f"Диск Windows найден: {drive_letter}\n\n"
-                logger.info(f"WinPE диск определён: {drive_letter}")
-                messagebox.showinfo("Определение диска", msg)
+                QMessageBox.information(self, "Определение диска", f"Диск Windows найден: {drive_letter}")
             else:
-                msg = "Не удалось определить диск Windows\n\n"
-                logger.warning("Не удалось определить диск Windows")
-                messagebox.showwarning("Ошибка", msg)
+                QMessageBox.warning(self, "Ошибка", "Не удалось определить диск Windows")
         except Exception as e:
-            logger.error(f"Ошибка определения диска: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось определить диск:\n{e}")
+            QMessageBox.critical(self, "Ошибка", f"Не удалось определить диск:\n{e}")
 
-    def _remove_windows_devender(self):
-        """Удалить ТОЛЬКО Windows Defender (без брандмауэра) из WinPE"""
+    def _remove_windows_defender(self):
         try:
             from modules.winpe_defender import (
-                remove_defender_completely,
-                is_winpe_environment,
-                get_available_drives
+                remove_defender_completely, is_winpe_environment, get_available_drives
             )
-            
             if not is_winpe_environment():
-                messagebox.showerror(
-                    "❌ ОШИБКА",
+                QMessageBox.critical(
+                    self, "Ошибка",
                     "Вы не находитесь в среде WinPE!\n\n"
                     "Функция удаления Windows Defender работает ТОЛЬКО из WinPE.\n\n"
-                    "Запустите DedHelper из WinPE\n"
+                    "Запустите DedHelper из WinPE"
                 )
                 return
-            
-            auto_detected = self.system_commands.get_winpe_drive_letter()
-            if not auto_detected:
-                auto_detected = "C:"
-            
+
+            auto_detected = self.system_commands.get_winpe_drive_letter() or "C:"
             drives = get_available_drives()
-            
             drive_list = "\n".join([
-                f"  {d['letter']} {'✅ Windows' if d['is_windows'] else '📁 Диск'}"
+                f"  {d['letter']} {'Windows' if d['is_windows'] else 'Диск'}"
                 for d in drives
-            ])
-            
-            if not drive_list:
-                drive_list = "  (нет доступных дисков)"
-            
+            ]) or "  (нет доступных дисков)"
+
             msg = (
                 f"ВНИМАНИЕ! Будет удалён Windows Defender\n\n"
                 f"Будут удалены:\n"
-                f"  • Все файлы Windows Defender\n"
-                f"  • Службы Defender (WinDefend, WdNisSvc, Sense)\n"
-                f"  • Драйверы Defender\n"
-                f"  • Настройки реестра Defender\n\n"
-                f"✅ Брандмауэр и другие службы НЕ будут затронуты! Для корректной работы таких программ как zapret\n\n"
-                f"📋 Доступные диски:\n{drive_list}\n\n"
-                f"🔄 Автоматически определён диск: {auto_detected}\n\n"
+                f"  - Все файлы Windows Defender\n"
+                f"  - Службы Defender (WinDefend, WdNisSvc, Sense)\n"
+                f"  - Драйверы Defender\n"
+                f"  - Настройки реестра Defender\n\n"
+                f"Брандмауэр и другие службы НЕ будут затронуты!\n\n"
+                f"Доступные диски:\n{drive_list}\n\n"
+                f"Автоматически определён диск: {auto_detected}\n\n"
                 f"Введите букву диска с Windows (например, D:) или оставьте пустым:"
             )
-            
-            from tkinter import simpledialog
-            drive_input = simpledialog.askstring(
-                "ВЫБОР ДИСКА",
-                msg,
-                parent=self.root
-            )
-            
-            if drive_input and drive_input.strip():
+            drive_input, ok = QInputDialog.getText(self, "ВЫБОР ДИСКА", msg)
+            if ok and drive_input.strip():
                 drive_letter = drive_input.strip().upper()
                 if not drive_letter.endswith(':'):
                     drive_letter += ':'
             else:
                 drive_letter = auto_detected
-            
+
             if not os.path.exists(drive_letter):
-                messagebox.showerror("❌ ОШИБКА", f"Диск {drive_letter} не существует!")
+                QMessageBox.critical(self, "ОШИБКА", f"Диск {drive_letter} не существует!")
                 return
-            
-            self.status_var.set(f"🗑️ Удаление Windows Defender с диска {drive_letter}...")
-            self.root.update()
-            
+
+            self.statusBar().showMessage(f"Удаление Windows Defender с диска {drive_letter}...")
+            QApplication.processEvents()
             result = remove_defender_completely(drive_letter)
-            
+
             if result['success']:
-                messagebox.showinfo("✅ УСПЕХ", result['message'])
-                logger.info(f"Windows Defender удалён: {result['details']}")
+                QMessageBox.information(self, "УСПЕХ", result['message'])
             else:
-                messagebox.showerror("❌ ОШИБКА", result['message'])
-                logger.error(f"Ошибка удаления Defender: {result['message']}")
-            
+                QMessageBox.critical(self, "ОШИБКА", result['message'])
+
             if result.get('errors'):
-                error_details = "\n".join(result['errors'])
-                messagebox.showwarning(
-                    "⚠ Предупреждения",
-                    f"Были обнаружены следующие проблемы:\n\n{error_details}"
-                )
-            
-            self.status_var.set("✅ Готово")
-            
+                QMessageBox.warning(self, "Предупреждения",
+                                    "Проблемы:\n\n" + "\n".join(result['errors']))
+            self.statusBar().showMessage("Готово")
         except ImportError as e:
             logger.error(f"Модуль winpe_defender не найден: {e}")
-            messagebox.showerror("❌ Ошибка", "Модуль удаления Defender не найден")
+            QMessageBox.critical(self, "Ошибка", "Модуль удаления Defender не найден")
         except Exception as e:
             logger.error(f"Ошибка удаления Defender: {e}")
-            messagebox.showerror("❌ Ошибка", f"Не удалось удалить Defender:\n{e}")
-
-
+            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить Defender:\n{e}")
 
     def _replace_sethc_winpe(self):
-        """Заменить sethc.exe на выбранный файл - ДЛЯ WINPE (простой способ)"""
-        import os
-        import shutil
-        
-        # Определяем диск Windows
-        from modules.system import SystemCommands
-        sys_cmd = SystemCommands()
-        drive_letter = sys_cmd.get_winpe_drive_letter()
-        
-        if not drive_letter:
-            # Проверяем все диски
-            for letter in 'CDEFGHIJK':
-                test_path = f"{letter}:\\Windows\\System32\\sethc.exe"
-                if os.path.exists(test_path):
-                    drive_letter = f"{letter}:"
-                    break
-        
-        if not drive_letter:
-            messagebox.showerror("Ошибка", "Не удалось найти диск с Windows!\nУбедитесь, что вы в WinPE.")
-            return
-        
-        # Пути
-        sethc_path = f"{drive_letter}\\Windows\\System32\\sethc.exe"
-        
-        if not os.path.exists(sethc_path):
-            messagebox.showerror("Ошибка", f"sethc.exe не найден")
-            return
-        
-        # Выбираем файл для замены
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл для замены sethc.exe",
-            filetypes=[("EXE файлы", "*.exe"), ("Все файлы", "*.*")]
-        )
-        if not file_path:
-            return
-        
-        file_path = file_path.replace('/', '\\')
-        
-        if not os.path.exists(file_path):
-            messagebox.showerror("Ошибка", f"Файл не найден:\n{file_path}")
-            return
-        
-        # Подтверждение
-        if not messagebox.askyesno(
-            "Подтверждение",
-            f"Заменить sethc.exe на {file_path}?\n\n"
-        ):
-            return
-        
-        try:
-            # Удаляем старый файл
-            if os.path.exists(sethc_path):
-                os.remove(sethc_path)
-            
-            # Копируем новый
-            logger.info(f"Копируем: {file_path} -> {sethc_path}")
-            shutil.copy2(file_path, sethc_path)
-            
-            # Проверяем
-            if os.path.exists(sethc_path):
-                messagebox.showinfo("Успех", "✅ sethc.exe успешно заменен!\n\n")
-            else:
-                messagebox.showerror("Ошибка", "❌ Не удалось скопировать файл!")
-                
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось заменить sethc:\n{str(e)}")
-
-
+        self._do_replace_system_file("sethc")
 
     def _replace_utilman_winpe(self):
-        """Заменить utilman.exe на выбранный файл - ДЛЯ WINPE (простой способ)"""
-        import os
-        import shutil
-        
-        from modules.system import SystemCommands
-        sys_cmd = SystemCommands()
-        drive_letter = sys_cmd.get_winpe_drive_letter()
-        
+        self._do_replace_system_file("utilman")
+
+    def _restore_sethc_winpe(self):
+        self._do_restore_system_file("sethc", "sethc.exe")
+
+    def _restore_utilman_winpe(self):
+        self._do_restore_system_file("utilman", "Utilman.exe")
+
+    def _do_replace_system_file(self, name: str):
+        drive_letter = self.system_commands.get_winpe_drive_letter()
         if not drive_letter:
             for letter in 'CDEFGHIJK':
-                test_path = f"{letter}:\\Windows\\System32\\utilman.exe"
-                if os.path.exists(test_path):
+                if os.path.exists(f"{letter}:\\Windows\\System32\\{name}.exe"):
                     drive_letter = f"{letter}:"
                     break
-        
         if not drive_letter:
-            messagebox.showerror("Ошибка", "Не удалось найти диск с Windows!\nУбедитесь, что вы в WinPE.")
+            QMessageBox.critical(self, "Ошибка", "Не удалось найти диск с Windows!")
             return
-        
-        utilman_path = f"{drive_letter}\\Windows\\System32\\utilman.exe"
-        
-        if not os.path.exists(utilman_path):
-            messagebox.showerror("Ошибка", f"utilman.exe не найден по пути:\n{utilman_path}")
+
+        target_path = f"{drive_letter}\\Windows\\System32\\{name}.exe"
+        if not os.path.exists(target_path):
+            QMessageBox.critical(self, "Ошибка", f"{name}.exe не найден")
             return
-        
-        file_path = filedialog.askopenfilename(
-            title="Выберите файл для замены utilman.exe",
-            filetypes=[("EXE файлы", "*.exe"), ("Все файлы", "*.*")]
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, f"Выберите файл для замены {name}.exe", "",
+            "EXE файлы (*.exe);;Все файлы (*.*)"
         )
         if not file_path:
             return
-        
         file_path = file_path.replace('/', '\\')
 
-        if not os.path.exists(file_path):
-            messagebox.showerror("Ошибка", f"Файл не найден:\n{file_path}")
+        if QMessageBox.question(
+            self, "Подтверждение",
+            f"Заменить {name}.exe на {file_path}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
             return
-        
-        if not messagebox.askyesno(
-            "Подтверждение",
-            f"Заменить utilman.exe на {file_path}?\n\n"
-        ):
-            return
-        
-        try:            
-            if os.path.exists(utilman_path):
-                os.remove(utilman_path)
-            
-            logger.info(f"Копируем: {file_path} -> {utilman_path}")
-            shutil.copy2(file_path, utilman_path)
-            
-            if os.path.exists(utilman_path):
-                messagebox.showinfo("Успех", "✅ utilman.exe успешно заменен!\n\n")
-            else:
-                messagebox.showerror("Ошибка", "❌ Не удалось скопировать файл!")
-                
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось заменить utilman:\n{str(e)}")
 
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            shutil.copy2(file_path, target_path)
+            if os.path.exists(target_path):
+                QMessageBox.information(self, "Успех", f"{name}.exe успешно заменён!")
+            else:
+                QMessageBox.critical(self, "Ошибка", "Не удалось скопировать файл!")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось заменить {name}:\n{str(e)}")
+
+    def _do_restore_system_file(self, name: str, embedded_name: str):
+        drive_letter = self.system_commands.get_winpe_drive_letter()
+        if not drive_letter:
+            for letter in 'CDEFGHIJK':
+                if os.path.exists(f"{letter}:\\Windows\\System32\\{name}.exe"):
+                    drive_letter = f"{letter}:"
+                    break
+        if not drive_letter:
+            QMessageBox.critical(self, "Ошибка", "Не удалось найти диск с Windows!")
+            return
+
+        target_path = f"{drive_letter}\\Windows\\System32\\{name}.exe"
+        embedded = self._get_embedded_file_path(embedded_name)
+        if not embedded:
+            QMessageBox.critical(self, "Ошибка", f"Встроенный {name}.exe не найден!")
+            return
+
+        if QMessageBox.question(
+            self, "Подтверждение", f"Восстановить {name}.exe?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if os.path.exists(target_path):
+                os.remove(target_path)
+            shutil.copy2(embedded, target_path)
+            if os.path.exists(target_path):
+                QMessageBox.information(self, "Успех", f"{name}.exe восстановлен!")
+            else:
+                QMessageBox.critical(self, "Ошибка", "Не удалось восстановить файл!")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось восстановить {name}:\n{str(e)}")
 
     def _get_embedded_file_path(self, filename: str) -> str:
-        import os
-        import sys
-        
-        # Пути для поиска
-        search_paths = []
-        
-        # 1. Если запущено из EXE (PyInstaller)
+        paths = []
         if hasattr(sys, '_MEIPASS'):
-            search_paths.append(os.path.join(sys._MEIPASS, 'modules', filename))
-            search_paths.append(os.path.join(sys._MEIPASS, filename))
-        
-        # 2. Если запущено из исходников
+            paths += [
+                os.path.join(sys._MEIPASS, 'modules', filename),
+                os.path.join(sys._MEIPASS, filename),
+            ]
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        search_paths.append(os.path.join(script_dir, 'modules', filename))
-        search_paths.append(os.path.join(script_dir, filename))
-        
-        # 3. Текущая директория
-        search_paths.append(os.path.join(os.getcwd(), 'modules', filename))
-        search_paths.append(os.path.join(os.getcwd(), filename))
-        
-        # Ищем файл
-        for path in search_paths:
+        paths += [
+            os.path.join(script_dir, 'modules', filename),
+            os.path.join(script_dir, filename),
+            os.path.join(os.getcwd(), 'modules', filename),
+            os.path.join(os.getcwd(), filename),
+        ]
+        for path in paths:
             if os.path.exists(path):
-                logger.info(f"Найден встроенный файл: {path}")
                 return path.replace('/', '\\')
-        
-        logger.error(f"Файл не найден: {filename}")
         return None
 
-
-    def _restore_sethc_winpe(self):
-        """Восстановить оригинальный sethc.exe из встроенных ресурсов или бэкапа"""
-        import os
-        import shutil
-        
-        from modules.system import SystemCommands
-        sys_cmd = SystemCommands()
-        drive_letter = sys_cmd.get_winpe_drive_letter()
-        
-        if not drive_letter:
-            for letter in 'CDEFGHIJK':
-                test_path = f"{letter}:\\Windows\\System32\\sethc.exe"
-                if os.path.exists(test_path):
-                    drive_letter = f"{letter}:"
-                    break
-        
-        if not drive_letter:
-            messagebox.showerror("Ошибка", "Не удалось найти диск с Windows!")
-            return
-        
-        sethc_path = f"{drive_letter}\\Windows\\System32\\sethc.exe"
-        
-        # Получаем путь к встроенному sethc.exe
-        embedded_sethc = self._get_embedded_file_path('sethc.exe')
-        
-        if not messagebox.askyesno(
-            "Подтверждение",
-            f"Восстановить sethc.exe?\n\n"
-        ):
-            return
-        
-        try:
-            if os.path.exists(sethc_path):
-                os.remove(sethc_path)
-            shutil.copy2(embedded_sethc, sethc_path)
-            
-            if os.path.exists(sethc_path):
-                messagebox.showinfo("Успех", "✅ sethc.exe восстановлен!")
-            else:
-                messagebox.showerror("Ошибка", "❌ Не удалось восстановить файл!")
-                
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось восстановить sethc:\n{str(e)}")
-
-    def _restore_utilman_winpe(self):
-        """Восстановить оригинальный utilman.exe из встроенных ресурсов или бэкапа"""
-        import os
-        import shutil
-        
-        from modules.system import SystemCommands
-        sys_cmd = SystemCommands()
-        drive_letter = sys_cmd.get_winpe_drive_letter()
-        
-        if not drive_letter:
-            for letter in 'CDEFGHIJK':
-                test_path = f"{letter}:\\Windows\\System32\\utilman.exe"
-                if os.path.exists(test_path):
-                    drive_letter = f"{letter}:"
-                    break
-        
-        if not drive_letter:
-            messagebox.showerror("Ошибка", "Не удалось найти диск с Windows!")
-            return
-        
-        utilman_path = f"{drive_letter}\\Windows\\System32\\utilman.exe"
-        
-        embedded_utilman = self._get_embedded_file_path('Utilman.exe')
-        
-        if not messagebox.askyesno(
-            "Подтверждение",
-            f"Восстановить utilman.exe?\n\n"
-        ):
-            return
-        
-        try:
-            if os.path.exists(utilman_path):
-                os.remove(utilman_path)
-            shutil.copy2(embedded_utilman, utilman_path)
-            
-            if os.path.exists(utilman_path):
-                messagebox.showinfo("Успех", "✅ utilman.exe восстановлен!")
-            else:
-                messagebox.showerror("Ошибка", "❌ Не удалось восстановить файл!")
-                
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось восстановить utilman:\n{str(e)}")
-
     def _auto_detect_winpe_drive(self):
-        """Автоматически определить букву диска Windows (тихое определение)"""
         try:
             drive_letter = self.system_commands.get_winpe_drive_letter()
             if drive_letter:
-                logger.info(f"Автоматически определён диск Windows: {drive_letter}")
-                self.status_var.set(f"Администратор | Диск: {drive_letter}")
-            else:
-                logger.debug("Определение диска: запущено из Windows (не WinPE)")
+                self.statusBar().showMessage(f"Администратор | Диск: {drive_letter}")
         except Exception as e:
-            logger.error(f"Ошибка автоматического определения диска: {e}")
+            logger.error(f"Ошибка автоопределения диска: {e}")
 
-    def _clean_temp(self):
-        """Очистить папку Temp"""
-        try:
-            logger.info("Очистка папки Temp")
-            temp_dir = os.environ.get('TEMP', '')
-            if temp_dir:
-                count = 0
-                for file in os.listdir(temp_dir):
-                    try:
-                        os.remove(os.path.join(temp_dir, file))
-                        count += 1
-                    except Exception:
-                        pass
-                logger.info(f"Temp очищен ({count} файлов)")
-                messagebox.showinfo("Успех", f"Temp очищен ({count} файлов)")
-        except Exception as e:
-            logger.error(f"Ошибка при очистке Temp: {e}")
-            messagebox.showerror("Ошибка", str(e))
+    # ==================== ВКЛАДКА ПРОВОДНИК ====================
 
-    def _clean_recycle(self):
-        """Очистить корзину"""
-        try:
-            logger.info("Очистка корзины")
-            run_hidden_command('cleanmgr /d C /VERYLOWDISK')
-            messagebox.showinfo("Успех", "Корзина очищается")
-        except Exception as e:
-            logger.error(f"Ошибка при очистке корзины: {e}")
-            messagebox.showerror("Ошибка", str(e))
+    def _create_explorer_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
 
-    # ==================== ПРОВОДНИК ====================
+        title_label = QLabel("Встроенный проводник")
+        title_label.setStyleSheet(f"""
+            color: {COLORS['accent']};
+            font-size: 11pt; font-weight: bold;
+            background-color: transparent; border: none;
+        """)
+        layout.addWidget(title_label)
 
-    def _create_explorer_tab(self, parent):
-        # Frame с явным цветом
-        info_frame = tk.Frame(parent, bg=COLORS['bg_medium'])
-        info_frame.pack(fill=tk.X, padx=10, pady=10)
+        btn_layout = QHBoxLayout()
 
-        # Заголовок
-        title_label = tk.Label(
-            info_frame,
-            text="Встроенный проводник",
-            font=('Segoe UI', 11, 'bold'),
-            bg=COLORS['bg_medium'],
-            fg=COLORS['accent']
-        )
-        title_label.pack(pady=5)
+        exp_btn = QPushButton("Запустить Explorer++")
+        exp_btn.setMinimumHeight(50)
+        exp_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {COLORS['accent']};
+                color: {COLORS['text_main']};
+                font-size: 11pt; font-weight: bold;
+                padding: 10px 20px; border-radius: 5px;
+                border: 1px solid #ffffff;
+            }}
+            QPushButton:hover {{
+                background-color: {COLORS['accent_hover']};
+                border: 1px solid #ffffff;
+            }}
+        """)
+        exp_btn.clicked.connect(self._launch_explorer)
+        btn_layout.addWidget(exp_btn)
 
-        btn_frame = tk.Frame(info_frame, bg=COLORS['bg_medium'])
-        btn_frame.pack(pady=15)
+        win_btn = QPushButton("Обычный проводник")
+        win_btn.setMinimumHeight(50)
+        win_btn.clicked.connect(self._launch_windows_explorer)
+        btn_layout.addWidget(win_btn)
 
-        exp_btn = tk.Button(
-            btn_frame,
-            text="Запустить Explorer++",
-            command=self._launch_explorer,
-            font=('Segoe UI', 11, 'bold'),
-            bg=COLORS['accent'],
-            fg=COLORS['text_main'],
-            activebackground=COLORS['accent_hover'],
-            relief='flat',
-            padx=20,
-            pady=10,
-            cursor='hand2'
-        )
-        exp_btn.pack(side=tk.LEFT, padx=10)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        layout.addStretch()
 
-        win_btn = tk.Button(
-            btn_frame,
-            text="Обычный проводник",
-            command=self._launch_windows_explorer,
-            font=('Segoe UI', 11),
-            bg=COLORS['bg_light'],
-            fg=COLORS['text_main'],
-            activebackground=COLORS['accent'],
-            relief='flat',
-            padx=20,
-            pady=10,
-            cursor='hand2'
-        )
-        win_btn.pack(side=tk.LEFT, padx=10)
-
-        # Статус
-        status_text = scrolledtext.ScrolledText(parent, height=4, bg=COLORS['bg_medium'], fg=COLORS['text_main'], font=('Segoe UI', 10))
-        status_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        explorer_exists = os.path.exists(self.explorer_path)
-        status_text.insert(tk.END, f"Путь: {self.explorer_path}\n")
-        status_text.insert(tk.END, f"Статус: {'Найден и готов к запуску' if explorer_exists else 'Не найден'}\n")
-
-        if not explorer_exists:
-            status_text.insert(tk.END, f"\nВНИМАНИЕ: Explorer++ не найден в ресурсах!\n")
-        else:
-            status_text.insert(tk.END, f"\nExplorer++ встроен в программу и готов к использованию.\n")
+        self.notebook.addTab(widget, "Проводник")
 
     def _launch_explorer(self):
-        """Запустить Explorer++ из встроенных ресурсов с рандомным именем"""
         try:
-            # Проверяем и извлекаем если нужно
             if not os.path.exists(self.explorer_path):
                 self._extract_explorer()
-            
             if not os.path.exists(self.explorer_path):
-                messagebox.showerror("Ошибка", "Explorer++ не найден в ресурсах")
+                QMessageBox.critical(self, "Ошибка", "Explorer++ не найден в ресурсах")
                 return
-            
-            # Генерируем рандомное имя для копии
-            import random
-            import string
             random_name = ''.join(random.choices(string.ascii_letters + string.digits, k=8)) + '.exe'
             temp_explorer = os.path.join(self.temp_dir, random_name)
-            
-            # Копируем с рандомным именем
             shutil.copy2(self.explorer_path, temp_explorer)
-            
             if os.path.exists(temp_explorer):
                 subprocess.Popen([temp_explorer])
-                messagebox.showinfo("Успех", f"Explorer++ запущен\nИмя процесса: {random_name}")
+                QMessageBox.information(self, "Успех", f"Explorer++ запущен\nИмя процесса: {random_name}")
             else:
-                messagebox.showerror("Ошибка", "Не удалось создать копию Explorer++")
+                QMessageBox.critical(self, "Ошибка", "Не удалось создать копию Explorer++")
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось запустить Explorer++:\n{e}")
-    
+            QMessageBox.critical(self, "Ошибка", f"Не удалось запустить Explorer++:\n{e}")
+
     def _launch_windows_explorer(self):
         try:
             subprocess.Popen('explorer.exe')
         except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    # ==================== ЗАКРЫТИЕ ====================
+
+    def closeEvent(self, event):
+        try:
+            if self.frozen_pids:
+                for pid in self.frozen_pids:
+                    try:
+                        self.process_manager.resume_process(pid)
+                    except Exception:
+                        pass
+            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+            relaunch_temp = os.environ.get('DEDHELPER_TEMP_DIR')
+            if relaunch_temp and os.path.exists(relaunch_temp):
+                try:
+                    subprocess.Popen(
+                        f'cmd /c timeout /t 1 /nobreak > nul & rmdir /s /q "{relaunch_temp}"',
+                        shell=True,
+                        creationflags=CREATE_NO_WINDOW,
+                        startupinfo=startupinfo_hide()
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"Ошибка при закрытии: {e}")
+        finally:
+            event.accept()
 
 
 def main():
+    # Глобальный перехватчик исключений — пишет всё в лог, а не молча вешает процесс
+    def _excepthook(exc_type, exc_value, exc_tb):
+        import traceback
+        tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        logger.error(f"Необработанное исключение:\n{tb}")
+        # На всякий случай — печатаем в stderr (видно при запуске из консоли)
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = _excepthook
+
     if not is_admin():
         run_as_admin()
-    
-    root = tk.Tk()
-    app = DedHelperApp(root)
-    root.mainloop()
+        # run_as_admin() при успехе делает sys.exit(0), но если что-то пошло не так —
+        # продолжаем и пробуем запуститься без прав (без краша)
+        if is_admin():
+            pass  # уже админ
 
+    if relaunch_with_random_name():
+        sys.exit(0)
+
+    try:
+        app = QApplication(sys.argv)
+        app.setStyle('Fusion')
+
+        try:
+            window = DedHelperApp()
+        except Exception as e:
+            logger.exception("Ошибка создания окна")
+            # Пробуем показать хотя бы сообщение об ошибке
+            err = QMessageBox()
+            err.setWindowTitle("DedHelper — Ошибка запуска")
+            err.setIcon(QMessageBox.Icon.Critical)
+            err.setText(f"Не удалось создать главное окно:\n\n{e}\n\n"
+                        f"Подробности в {os.path.join(os.environ.get('TEMP', '.'), 'DedHelper.log')}")
+            err.exec()
+            sys.exit(1)
+
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+        logger.info("Окно показано, запуск event loop")
+        exit_code = app.exec()
+        logger.info(f"Выход, код: {exit_code}")
+        sys.exit(exit_code)
+
+    except Exception as e:
+        logger.exception("Критическая ошибка в main()")
+        try:
+            print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", file=sys.stderr)
+        except Exception:
+            pass
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
