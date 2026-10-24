@@ -1,8 +1,13 @@
 """
-Модуль системных команд Windows
-Перезагрузка, выход, WinRE, UAC, sfc и другие системные функции
-"""
+Системные команды (офлайн-aware).
 
+Изменения 7.2:
+  * get_winpe_drive_letter -> OfflineSession.drive
+  * sethc/utilman — через OfflineSession.system32()
+  * UAC / шрифт / LogonUI — через офлайн-хайв
+  * restart/shutdown/logout/enter_winre/run_sfc/run_dism — возвращают
+    False в офлайне (нет смысла из WinPE)
+"""
 import subprocess
 import ctypes
 import os
@@ -10,738 +15,352 @@ import shutil
 import logging
 import random
 import string
+import winreg
 
-# Константа для скрытия окна консоли
+try:
+    from .offline import OfflineSession
+except (ImportError, ValueError):
+    from offline import OfflineSession
+
 CREATE_NO_WINDOW = 0x08000000
-
-# Настройка логирования
 logger = logging.getLogger(__name__)
 
 
-def generate_random_name(length: int = 8) -> str:
-    """Сгенерировать случайное имя для процесса"""
+def generate_random_name(length=8):
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
 
-def run_hidden_command(cmd: str, capture_output: bool = False) -> subprocess.CompletedProcess:
-    """Выполнить команду без показа окна консоли"""
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
+def run_hidden_command(cmd, capture_output=False):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return subprocess.run(cmd, shell=True, capture_output=capture_output,
+                          startupinfo=si, creationflags=CREATE_NO_WINDOW)
 
+
+def run_hidden_powershell(ps_command, capture_output=True, random_name=True):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    if random_name:
+        import tempfile
+        temp_dir = tempfile.mkdtemp(prefix='PS_')
+        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
+                              'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+        ps_copy = os.path.join(temp_dir, generate_random_name(12) + '.exe')
+        try:
+            shutil.copy2(ps_exe, ps_copy)
+        except Exception:
+            ps_copy = ps_exe
+        return subprocess.run(
+            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+            capture_output=capture_output, startupinfo=si,
+            creationflags=CREATE_NO_WINDOW,
+        )
     return subprocess.run(
-        cmd,
-        shell=True,
-        capture_output=capture_output,
-        startupinfo=startupinfo,
-        creationflags=CREATE_NO_WINDOW
+        ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
+        capture_output=capture_output, startupinfo=si,
+        creationflags=CREATE_NO_WINDOW,
     )
 
 
-def run_hidden_powershell(ps_command: str, capture_output: bool = True, random_name: bool = True) -> subprocess.CompletedProcess:
-    """
-    Выполнить PowerShell команду без показа окна
-    
-    Args:
-        ps_command: Команда PowerShell для выполнения
-        capture_output: Захватывать ли вывод
-        random_name: Запускать ли с случайным именем процесса
-    """
-    import tempfile
-    import shutil
-    
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-    
-    if random_name:
-        # Создаём копию powershell.exe со случайным именем
-        temp_dir = tempfile.mkdtemp(prefix='PS_')
-        ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-        random_name_file = generate_random_name(12) + '.exe'
-        ps_copy = os.path.join(temp_dir, random_name_file)
-        
-        try:
-            shutil.copy2(ps_exe, ps_copy)
-        except Exception as e:
-            logger.error(f"Не удалось создать копию PowerShell: {e}")
-            ps_copy = ps_exe
-        
-        return subprocess.run(
-            [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-            capture_output=capture_output,
-            startupinfo=startupinfo,
-            creationflags=CREATE_NO_WINDOW
-        )
-    else:
-        return subprocess.run(
-            ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-            capture_output=capture_output,
-            startupinfo=startupinfo,
-            creationflags=CREATE_NO_WINDOW
-        )
-
-
 def decode_output(stdout_bytes: bytes) -> str:
-    """
-    Декодировать вывод команды с обработкой ошибок кодировки
-    
-    Args:
-        stdout_bytes: Байты вывода команды
-        
-    Returns:
-        str: Декодированная строка
-    """
     if not stdout_bytes:
         return ""
-    
-    # Пробуем UTF-8, затем cp1251 (кириллица Windows), затем с заменой ошибок
-    for encoding in ['utf-8', 'cp1251', 'cp866']:
+    for enc in ('utf-8', 'cp1251', 'cp866'):
         try:
-            return stdout_bytes.decode(encoding)
+            return stdout_bytes.decode(enc)
         except UnicodeDecodeError:
             continue
-    
-    # Если ничего не подошло, декодируем с заменой некорректных символов
     return stdout_bytes.decode('utf-8', errors='replace')
 
 
 class SystemCommands:
-    """Класс для выполнения системных команд"""
 
     def __init__(self):
         self.is_admin = ctypes.windll.shell32.IsUserAnAdmin()
-    
-    # ==================== СИСТЕМНЫЕ КОМАНДЫ ====================
-    
-    def restart_pc(self, timeout: int = 5) -> bool:
-        """Перезагрузить ПК"""
+
+    # ---------- офлайн-заглушки ----------
+    def _offline_denied(self, action: str) -> bool:
+        logger.warning(f"{action}: недоступно из WinPE (офлайн)")
+        return False
+
+    # ---------- shutdown / reboot ----------
+    def restart_pc(self, timeout=5):
+        if OfflineSession.active:
+            return self._offline_denied("restart_pc")
+        run_hidden_command(f'shutdown /r /t {timeout}')
+        return True
+
+    def shutdown_pc(self, timeout=5):
+        if OfflineSession.active:
+            return self._offline_denied("shutdown_pc")
+        run_hidden_command(f'shutdown /s /t {timeout}')
+        return True
+
+    def logout(self):
+        if OfflineSession.active:
+            return self._offline_denied("logout")
+        run_hidden_command('shutdown /l')
+        return True
+
+    def enter_winre(self):
+        if OfflineSession.active:
+            return self._offline_denied("enter_winre")
+        run_hidden_command('shutdown /r /o /t 0')
+        return True
+
+    def run_dialog(self):
         try:
-            cmd = f'shutdown /r /t {timeout}'
-            run_hidden_command(cmd)
+            subprocess.Popen('explorer.exe shell:::{2559a1f8-21d7-11d4-bdaf-00c04f60b9f0}')
             return True
         except Exception:
             return False
 
-    def shutdown_pc(self, timeout: int = 5) -> bool:
-        """Выключить ПК"""
-        try:
-            cmd = f'shutdown /s /t {timeout}'
-            run_hidden_command(cmd)
-            return True
-        except Exception:
-            return False
-
-    def logout(self) -> bool:
-        """Выйти из пользователя (завершение сеанса)"""
-        try:
-            cmd = 'shutdown /l'
-            run_hidden_command(cmd)
-            return True
-        except Exception:
-            return False
-
-    def enter_winre(self) -> bool:
-        """Войти в среду восстановления Windows (WinRE) — МГНОВЕННО"""
-        try:
-            # Мгновенная перезагрузка в среду восстановления (/t 0 = без задержки)
-            cmd = 'shutdown /r /o /t 0'
-            run_hidden_command(cmd)
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка входа в WinRE: {e}")
-            return False
-
-    def run_dialog(self) -> bool:
-        """Открыть диалог запуска программ (Win+R)"""
-        subprocess.Popen("rundll32.exe shell32.dll,#61", shell=True)
-    
-    # ==================== ВОССТАНОВЛЕНИЕ СИСТЕМЫ ====================
-    
+    # ---------- UAC / восстановление ----------
     def enable_uac(self) -> bool:
-        """Включить контроль учётных записей (UAC) - уровень 3"""
         try:
-            import winreg
-            # Открываем ключ с правами администратора - ПРАВИЛЬНЫЙ ПУТЬ
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
+            key = OfflineSession.open_hklm(
                 r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
-                0,
-                winreg.KEY_ALL_ACCESS
-            )
-            # EnableLUA = 1 включает UAC
+                winreg.KEY_ALL_ACCESS)
+        except OSError as e:
+            logger.error(f"enable_uac open: {e}")
+            return False
+        try:
             winreg.SetValueEx(key, 'EnableLUA', 0, winreg.REG_DWORD, 1)
-            # ConsentPromptBehaviorAdmin = 3 - запрос пароля (уровень 3 из 4)
             try:
-                winreg.SetValueEx(key, 'ConsentPromptBehaviorAdmin', 0, winreg.REG_DWORD, 3)
-            except Exception:
+                winreg.SetValueEx(key, 'ConsentPromptBehaviorAdmin', 0,
+                                  winreg.REG_DWORD, 5)
+            except OSError:
                 pass
-            # PromptOnSecureDesktop = 1 - запрос на безопасном рабочем столе
             try:
-                winreg.SetValueEx(key, 'PromptOnSecureDesktop', 0, winreg.REG_DWORD, 1)
-            except Exception:
+                winreg.SetValueEx(key, 'PromptOnSecureDesktop', 0,
+                                  winreg.REG_DWORD, 1)
+            except OSError:
                 pass
-            winreg.CloseKey(key)
             return True
-        except Exception as e:
-            print(f"Ошибка включения UAC: {e}")
+        except OSError as e:
+            logger.error(f"enable_uac: {e}")
             return False
-    
+        finally:
+            winreg.CloseKey(key)
+
     def disable_uac(self) -> bool:
-        """Отключить контроль учётных записей (UAC)"""
         try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
+            key = OfflineSession.open_hklm(
                 r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
-                0,
-                winreg.KEY_ALL_ACCESS
-            )
-            # EnableLUA = 0 отключает UAC
+                winreg.KEY_ALL_ACCESS)
+        except OSError:
+            return False
+        try:
             winreg.SetValueEx(key, 'EnableLUA', 0, winreg.REG_DWORD, 0)
+            return True
+        finally:
             winreg.CloseKey(key)
-            return True
-        except Exception as e:
-            print(f"Ошибка отключения UAC: {e}")
-            return False
-    
-    def run_sfc(self) -> bool:
-        """Запустить проверку целостности системных файлов (sfc /scannow)"""
-        try:
-            # Запускаем в отдельном окне, так как проверка долгая
-            cmd = 'start "SFC Scan" cmd /k "sfc /scannow"'
-            run_hidden_command(cmd)
-            return True
-        except Exception:
-            return False
 
-    def run_dism(self) -> bool:
-        """Запустить DISM для восстановления образа системы"""
-        try:
-            cmd = 'start "DISM Scan" cmd /k "DISM /Online /Cleanup-Image /RestoreHealth"'
-            run_hidden_command(cmd)
-            return True
-        except Exception:
-            return False
+    def run_sfc(self):
+        if OfflineSession.active:
+            return self._offline_denied("run_sfc")
+        run_hidden_command('start "SFC Scan" cmd /k "sfc /scannow"')
+        return True
 
-    def disable_test_mode(self) -> bool:
-        """Выключить тестовый режим загрузки драйверов без подписи"""
-        try:
-            cmd = 'bcdedit /set testsigning off'
-            result = run_hidden_command(cmd, capture_output=True)
-            return result.returncode == 0
-        except Exception:
-            return False
-
-    def enable_test_mode(self) -> bool:
-        """Включить тестовый режим загрузки драйверов без подписи"""
-        try:
-            cmd = 'bcdedit /set testsigning on'
-            result = run_hidden_command(cmd, capture_output=True)
-            return result.returncode == 0
-        except Exception:
-            return False
+    def run_dism(self):
+        if OfflineSession.active:
+            return self._offline_denied("run_dism")
+        run_hidden_command(
+            'start "DISM Scan" cmd /k "DISM /Online /Cleanup-Image /RestoreHealth"')
+        return True
 
     def restore_font_default(self) -> bool:
-        """Вернуть стандартный системный шрифт"""
         try:
-            import winreg
-            # Удаляем ключи, отвечающие за замену шрифта
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
+            key = OfflineSession.open_hklm(
                 r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes',
-                0,
-                winreg.KEY_SET_VALUE
-            )
-            # Удаляем замену для Segoe UI (основной шрифт Windows)
+                winreg.KEY_SET_VALUE | winreg.KEY_READ)
+        except OSError:
+            return False
+        try:
             try:
                 winreg.DeleteValue(key, 'Segoe UI')
             except OSError:
                 pass
+            return True
+        finally:
             winreg.CloseKey(key)
-            return True
-        except Exception:
-            return False
 
-    def restore_language_russian(self) -> bool:
-        """Вернуть русский язык раскладки"""
-        try:
-            # Сброс раскладки через PowerShell
-            ps_command = '''
-            $List = Get-WinUserLanguageList
-            $List[0].InputMethodTips.Clear()
-            $List[0].InputMethodTips.Add("0419:00000419")
-            Set-WinUserLanguageList $List -Force
-            '''
-            run_hidden_powershell(ps_command)
-            return True
-        except Exception:
-            return False
-    
-    # ==================== ФАЙЛЫ И ДОСТУП ====================
-
-    def take_ownership(self, filepath: str) -> bool:
-        """Получить полный доступ к файлу"""
-        try:
-            # Берём ownership
-            cmd1 = f'takeown /f "{filepath}" /a'
-            run_hidden_command(cmd1, capture_output=True)
-
-            # Даём полные права Administrators
-            cmd2 = f'icacls "{filepath}" /grant Administrators:F'
-            run_hidden_command(cmd2, capture_output=True)
-
-            return True
-        except Exception:
-            return False
-
-    def unlock_file(self, filepath: str) -> bool:
-        """Разблокировать файл (снять блокировку Windows)"""
-        try:
-            # Снимаем alternate data stream Zone.Identifier
-            ps_command = f'''
-            Unblock-File -Path "{filepath}"
-            '''
-            run_hidden_powershell(ps_command)
-            return True
-        except Exception:
-            return False
-    
     def restore_logonui(self) -> bool:
-        """Восстановить экран входа в систему (LogonUI)"""
         try:
-            import winreg
-            # Сбрасываем настройки LogonUI
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
+            key = OfflineSession.open_hklm(
                 r'SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI',
-                0,
-                winreg.KEY_SET_VALUE
-            )
-            # Включаем LogonUI
-            winreg.SetValueEx(key, 'LastLogonUID', 0, winreg.REG_DWORD, 1)
+                winreg.KEY_SET_VALUE | winreg.KEY_READ)
+        except OSError:
+            return False
+        try:
+            try:
+                winreg.SetValueEx(key, 'LastLogonUID', 0, winreg.REG_DWORD, 1)
+            except OSError:
+                pass
+            return True
+        finally:
             winreg.CloseKey(key)
+
+    # ---------- файлы ----------
+    def take_ownership(self, filepath):
+        try:
+            run_hidden_command(f'takeown /f "{filepath}" /a', capture_output=True)
+            run_hidden_command(
+                f'icacls "{filepath}" /grant Administrators:F', capture_output=True)
             return True
         except Exception:
             return False
-    
-    # ==================== СПЕЦИАЛЬНЫЕ ВОЗМОЖНОСТИ ====================
 
-    def _take_ownership_powershell(self, filepath: str) -> bool:
-        """
-        Взять файл в собственность через PowerShell с обходом TrustedInstaller
-        """
+    def unlock_file(self, filepath):
         try:
-            ps_script = f'''
-            $ErrorActionPreference = "Stop"
-            $file = "{filepath}"
-            
-            # Останавливаем TrustedInstaller если запущен
-            try {{
-                $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-                if ($ti) {{ Stop-Process $ti -Force }}
-            }} catch {{}}
-            
-            # Получаем текущие права
-            $acl = Get-Acl $file
-            
-            # Берём ownership на Administrators
-            $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-            $acl.SetOwner($adminAccount)
-            Set-Acl $file -AclObject $acl
-            
-            # Даём полные права Administrators
-            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $adminAccount,
-                "FullControl",
-                "Allow"
-            )
-            $acl.ResetAccessRule($rule)
-            Set-Acl $file -AclObject $acl
-            
-            # Снимаем все атрибуты
-            [System.IO.File]::SetAttributes($file, "Normal")
-            '''
-            result = run_hidden_powershell(ps_script)
-            return result.returncode == 0
-        except Exception as e:
-            print(f"Ошибка взятия ownership: {e}")
+            run_hidden_powershell(f'Unblock-File -Path "{filepath}"')
+            return True
+        except Exception:
             return False
 
+    # ---------- sethc / utilman ----------
     def replace_sethc(self, target_exe: str) -> bool:
-        r"""
-        Заменить sethc.exe (залипание клавиш) на другую программу
-        ЖЁСТКАЯ СИСТЕМА - прямой путь C:\Windows\System32\sethc.exe
-        """
-        try:
-            # Проверяем существование файла-источника
-            if not os.path.exists(target_exe):
-                logger.error(f"Файл-источник не найден: {target_exe}")
-                return False
-
-            # Жёсткий путь
-            sethc_path = r"C:\Windows\System32\sethc.exe"
-
-            logger.info(f"Замена sethc.exe файлом: {target_exe}")
-
-            # PowerShell скрипт с прямыми путями
-            ps_script = f'''
-$ErrorActionPreference = "Stop"
-
-$source = Get-Item "{target_exe}"
-$dest = Get-Item "{sethc_path}" -ErrorAction SilentlyContinue
-
-# Останавливаем TrustedInstaller
-try {{
-    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-    if ($ti) {{ Stop-Process $ti -Force }}
-}} catch {{}}
-
-if ($dest) {{
-    # Берём ownership
-    $acl = Get-Acl $dest.FullName
-    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-    $acl.SetOwner($adminAccount)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    # Даём полные права
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-    $acl.ResetAccessRule($rule)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
-    
-    # Удаляем оригинал
-    Remove-Item -Path $dest.FullName -Force
-}}
-
-# Копируем новый файл
-Copy-Item $source.FullName "{sethc_path}" -Force
-'''
-
-            result = run_hidden_powershell(ps_script)
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"Ошибка замены sethc: {e}")
+        if not os.path.exists(target_exe):
             return False
+        sethc_path = OfflineSession.system32('sethc.exe')
+        return self._replace_file_powershell(target_exe, sethc_path)
 
     def replace_utilman(self, target_exe: str) -> bool:
-        r"""
-        Заменить utilman.exe (специальные возможности) на другую программу
-        ЖЁСТКАЯ СИСТЕМА - прямой путь C:\Windows\System32\utilman.exe
-        """
-        try:
-            # Проверяем существование файла-источника
-            if not os.path.exists(target_exe):
-                logger.error(f"Файл-источник не найден: {target_exe}")
-                return False
-
-            # Жёсткий путь
-            utilman_path = r"C:\Windows\System32\utilman.exe"
-
-            logger.info(f"Замена utilman.exe файлом: {target_exe}")
-
-            # PowerShell скрипт с прямыми путями
-            ps_script = f'''
-$ErrorActionPreference = "Stop"
-
-$source = Get-Item "{target_exe}"
-$dest = Get-Item "{utilman_path}" -ErrorAction SilentlyContinue
-
-# Останавливаем TrustedInstaller
-try {{
-    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-    if ($ti) {{ Stop-Process $ti -Force }}
-}} catch {{}}
-
-if ($dest) {{
-    # Берём ownership
-    $acl = Get-Acl $dest.FullName
-    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-    $acl.SetOwner($adminAccount)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    # Даём полные права
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-    $acl.ResetAccessRule($rule)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
-    
-    # Удаляем оригинал
-    Remove-Item -Path $dest.FullName -Force
-}}
-
-# Копируем новый файл
-Copy-Item $source.FullName "{utilman_path}" -Force
-'''
-
-            result = run_hidden_powershell(ps_script)
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"Ошибка замены utilman: {e}")
+        if not os.path.exists(target_exe):
             return False
+        utilman_path = OfflineSession.system32('utilman.exe')
+        return self._replace_file_powershell(target_exe, utilman_path)
 
     def restore_sethc(self, modules_dir: str = None) -> bool:
-        """Восстановить оригинальный sethc.exe из папки modules"""
-        try:
-            # Жёсткий путь
-            sethc_path = r"C:\Windows\System32\sethc.exe"
-
-            # Если не указана папка modules, пробуем найти автоматически
-            if modules_dir is None:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                modules_dir = os.path.join(os.path.dirname(script_dir), 'modules')
-
-            source_sethc = os.path.join(modules_dir, 'sethc.exe')
-
-            # Проверяем наличие файла в modules
-            if not os.path.exists(source_sethc):
-                logger.error(f"Файл не найден: {source_sethc}")
-                return False
-
-            # PowerShell скрипт с прямыми путями
-            ps_script = f'''
-$ErrorActionPreference = "Stop"
-
-$source = Get-Item "{source_sethc}"
-$dest = Get-Item "{sethc_path}" -ErrorAction SilentlyContinue
-
-# Останавливаем TrustedInstaller
-try {{
-    $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
-    if ($ti) {{ Stop-Process $ti -Force }}
-}} catch {{}}
-
-if ($dest) {{
-    # Берём ownership
-    $acl = Get-Acl $dest.FullName
-    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-    $acl.SetOwner($adminAccount)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    # Даём полные права
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-    $acl.ResetAccessRule($rule)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
-    
-    # Удаляем оригинал
-    Remove-Item -Path $dest.FullName -Force
-}}
-
-# Копируем новый файл
-Copy-Item $source.FullName "{sethc_path}" -Force
-'''
-
-            result = run_hidden_powershell(ps_script)
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"Ошибка восстановления sethc: {e}")
+        if modules_dir is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            modules_dir = os.path.dirname(script_dir)
+        src = os.path.join(modules_dir, 'modules', 'sethc.exe')
+        if not os.path.exists(src):
+            src = os.path.join(modules_dir, 'sethc.exe')
+        if not os.path.exists(src):
             return False
+        return self._replace_file_powershell(src, OfflineSession.system32('sethc.exe'))
 
     def restore_utilman(self, modules_dir: str = None) -> bool:
-        """Восстановить оригинальный utilman.exe из папки modules"""
-        try:
-            # Жёсткий путь
-            utilman_path = r"C:\Windows\System32\utilman.exe"
+        if modules_dir is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            modules_dir = os.path.dirname(script_dir)
+        src = os.path.join(modules_dir, 'modules', 'Utilman.exe')
+        if not os.path.exists(src):
+            src = os.path.join(modules_dir, 'Utilman.exe')
+        if not os.path.exists(src):
+            return False
+        return self._replace_file_powershell(src, OfflineSession.system32('utilman.exe'))
 
-            # Если не указана папка modules, пробуем найти автоматически
-            if modules_dir is None:
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                modules_dir = os.path.join(os.path.dirname(script_dir), 'modules')
-
-            source_utilman = os.path.join(modules_dir, 'Utilman.exe')
-
-            # Проверяем наличие файла в modules
-            if not os.path.exists(source_utilman):
-                logger.error(f"Файл не найден: {source_utilman}")
+    def _replace_file_powershell(self, src, dst) -> bool:
+        if OfflineSession.active:
+            # офлайн: SYSTEM + файл не заблокирован -> простая замена через os
+            try:
+                if not os.path.isfile(src):
+                    return False
+                try:
+                    os.chmod(dst, 0o777)
+                except OSError:
+                    pass
+                if os.path.exists(dst):
+                    try:
+                        os.remove(dst)
+                    except OSError:
+                        pass
+                shutil.copy2(src, dst)
+                return True
+            except Exception as e:
+                logger.error(f"_replace_file (offline): {e}")
                 return False
-
-            # PowerShell скрипт с прямыми путями
-            ps_script = f'''
+        # online: powershell с ownership
+        ps_script = f'''
 $ErrorActionPreference = "Stop"
-
-$source = Get-Item "{source_utilman}"
-$dest = Get-Item "{utilman_path}" -ErrorAction SilentlyContinue
-
-# Останавливаем TrustedInstaller
+$src = "{src}"
+$dst = "{dst}"
+if (-not (Test-Path $src)) {{ exit 1 }}
 try {{
     $ti = Get-Process TrustedInstaller -ErrorAction SilentlyContinue
     if ($ti) {{ Stop-Process $ti -Force }}
 }} catch {{}}
-
-if ($dest) {{
-    # Берём ownership
-    $acl = Get-Acl $dest.FullName
-    $adminAccount = New-Object System.Security.Principal.NTAccount("Administrators")
-    $acl.SetOwner($adminAccount)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    # Даём полные права
-    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($adminAccount, "FullControl", "Allow")
-    $acl.ResetAccessRule($rule)
-    Set-Acl $dest.FullName -AclObject $acl
-    
-    [System.IO.File]::SetAttributes($dest.FullName, "Normal")
-    
-    # Удаляем оригинал
-    Remove-Item -Path $dest.FullName -Force
+if (Test-Path $dst) {{
+    try {{
+        $acl = Get-Acl $dst
+        $adm = New-Object System.Security.Principal.NTAccount("Administrators")
+        $acl.SetOwner($adm)
+        Set-Acl $dst -AclObject $acl
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $adm, "FullControl", "Allow")
+        $acl.ResetAccessRule($rule)
+        Set-Acl $dst -AclObject $acl
+        [System.IO.File]::SetAttributes($dst, "Normal")
+        Remove-Item $dst -Force
+    }} catch {{}}
 }}
-
-# Копируем новый файл
-Copy-Item $source.FullName "{utilman_path}" -Force
+Copy-Item $src $dst -Force
 '''
+        return run_hidden_powershell(ps_script).returncode == 0
 
-            result = run_hidden_powershell(ps_script)
-            return result.returncode == 0
-        except Exception as e:
-            logger.error(f"Ошибка восстановления utilman: {e}")
+    # ---------- восстановление из WinRE ----------
+    def create_restore_point(self, description="VirusBypass Tool"):
+        if OfflineSession.active:
             return False
+        ps = (f'Enable-ComputerRestore -Drive "C:\\"; '
+              f'Checkpoint-Computer -Description "{description}" '
+              f'-RestorePointType "MODIFY_SETTINGS"')
+        return run_hidden_powershell(ps).returncode == 0
 
-    # ==================== ЭКСТРЕННОЕ ВОССТАНОВЛЕНИЕ ====================
+    def run_system_restore(self):
+        if OfflineSession.active:
+            return False
+        run_hidden_command('start "System Restore" rstrui.exe')
+        return True
 
-    def create_restore_point(self, description: str = "VirusBypass Tool") -> bool:
-        """Создать точку восстановления системы"""
+    # ---------- WinPE ----------
+    def get_winpe_drive_letter(self):
+        if OfflineSession.active:
+            return OfflineSession.drive
         try:
-            ps_command = f'''
-            Enable-ComputerRestore -Drive "C:\"
-            Checkpoint-Computer -Description "{description}" -RestorePointType "MODIFY_SETTINGS"
-            '''
-            result = run_hidden_powershell(ps_command)
-            return result.returncode == 0
+            from .winpe_tools import get_windows_drive_letter
+            return get_windows_drive_letter()
         except Exception:
-            return False
+            return None
 
-    def run_system_restore(self) -> bool:
-        """Запустить восстановление системы"""
-        try:
-            cmd = 'start "System Restore" rstrui.exe'
-            run_hidden_command(cmd)
-            return True
-        except Exception:
-            return False
-
-    # ==================== РАБОТА ИЗ WINPE ====================
-
-    def get_winpe_drive_letter(self) -> str:
-        """
-        Определить букву диска Windows в среде WinPE
-        
-        Returns:
-            str: Буква диска (например, 'D:') или None
-        """
-        from .winpe_tools import get_windows_drive_letter
-        return get_windows_drive_letter()
-
-    def replace_sethc_winpe(self, target_exe: str = None) -> dict:
-        """
-        Заменить sethc.exe из среды WinPE
-        
-        Args:
-            target_exe: Путь к файлу для замены (по умолчанию cmd.exe)
-            
-        Returns:
-            dict: Результат операции {'success': bool, 'message': str, 'drive_letter': str}
-        """
+    def replace_sethc_winpe(self, target_exe=None) -> dict:
         from .winpe_tools import replace_sethc_winpe
         return replace_sethc_winpe(target_exe)
 
-    def replace_utilman_winpe(self, target_exe: str = None) -> dict:
-        """
-        Заменить utilman.exe из среды WinPE
-        
-        Args:
-            target_exe: Путь к файлу для замены (по умолчанию cmd.exe)
-            
-        Returns:
-            dict: Результат операции {'success': bool, 'message': str, 'drive_letter': str}
-        """
+    def replace_utilman_winpe(self, target_exe=None) -> dict:
         from .winpe_tools import replace_utilman_winpe
         return replace_utilman_winpe(target_exe)
 
-    def restore_sethc_winpe(self, modules_dir: str = None) -> dict:
-        """
-        Восстановить sethc.exe из среды WinPE
-        
-        Args:
-            modules_dir: Путь к папке modules с резервным файлом
-            
-        Returns:
-            dict: Результат операции
-        """
+    def restore_sethc_winpe(self, modules_dir=None) -> dict:
         from .winpe_tools import restore_sethc_winpe
         return restore_sethc_winpe(modules_dir)
 
-    def restore_utilman_winpe(self, modules_dir: str = None) -> dict:
-        """
-        Восстановить utilman.exe из среды WinPE
-        
-        Args:
-            modules_dir: Путь к папке modules с резервным файлом
-            
-        Returns:
-            dict: Результат операции
-        """
+    def restore_utilman_winpe(self, modules_dir=None) -> dict:
         from .winpe_tools import restore_utilman_winpe
         return restore_utilman_winpe(modules_dir)
 
-    def check_bitlocker_winpe(self, drive_letter: str = None) -> dict:
-        """
-        Проверить статус BitLocker в WinPE
-        
-        Args:
-            drive_letter: Буква диска для проверки
-            
-        Returns:
-            dict: Статус BitLocker
-        """
+    def check_bitlocker_winpe(self, drive_letter=None) -> dict:
         from .winpe_tools import check_bitlocker_status
         return check_bitlocker_status(drive_letter)
 
     def list_volumes_winpe(self) -> list:
-        """
-        Получить список всех томов в WinPE
-        
-        Returns:
-            list: Список томов с информацией
-        """
         from .winpe_tools import list_volumes
         return list_volumes()
 
 
-# Функции для быстрого доступа
 def restart_pc(timeout=5):
-    """Перезагрузить ПК"""
-    cmd = SystemCommands()
-    return cmd.restart_pc(timeout)
+    return SystemCommands().restart_pc(timeout)
 
 
 def enter_winre():
-    """Войти в WinRE"""
-    cmd = SystemCommands()
-    return cmd.enter_winre()
+    return SystemCommands().enter_winre()
 
 
 def run_sfc():
-    """Запустить sfc /scannow"""
-    cmd = SystemCommands()
-    return cmd.run_sfc()
-
-
-def disable_test_mode():
-    """Выключить тестовый режим"""
-    cmd = SystemCommands()
-    return cmd.disable_test_mode()
-
-def remove_defender_winpe(self) -> dict:
-    """
-    Удалить Windows Defender из WinPE
-    
-    Returns:
-        dict: Результат операции
-    """
-    from .winpe_defender import remove_defender_winpe
-    return remove_defender_winpe()
+    return SystemCommands().run_sfc()

@@ -174,7 +174,7 @@ def load_registry_hives(drive: str) -> dict:
             if check_system.returncode == 0 and check_software.returncode == 0:
                 result['success'] = True
                 result['message'] = 'Кусты реестра успешно загружены'
-                result['details'].append('✓ Кусты реестра загружены')
+                result['details'].append('Кусты реестра загружены')
                 return result
             
             time.sleep(1)
@@ -424,13 +424,13 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
     }
     
     if not is_admin():
-        result['message'] = '❌ Требуются права администратора!'
+        result['message'] = 'Требуются права администратора!'
         result['errors'].append('Недостаточно прав')
         return result
     
     if not is_winpe_environment():
         result['message'] = (
-            '❌ Вы не находитесь в среде WinPE!\n\n'
+            'Вы не находитесь в среде WinPE!\n\n'
             'Функция удаления Windows Defender работает ТОЛЬКО из WinPE.\n\n'
             'Запустите DedHelper из WinPE\n'
         )
@@ -444,19 +444,19 @@ def remove_defender_completely(drive_letter: str = None) -> dict:
     
     if not os.path.exists(f"{drive_letter}\\Windows\\System32\\winload.exe") and \
        not os.path.exists(f"{drive_letter}\\Windows\\System32\\winload.efi"):
-        result['message'] = f'❌ Windows не найдена на диске {drive_letter}!'
+        result['message'] = f'Windows не найдена на диске {drive_letter}!'
         result['errors'].append(f'Windows не найдена на {drive_letter}')
         return result
     
     logger.info("=" * 60)
-    logger.info("     УДАЛЕНИЕ ТОЛЬКО WINDOWS DEFENDER (PE Edition)")
+    logger.info("     УДАЛЕНИЕ WINDOWS DEFENDER")
     logger.info("=" * 60)
     logger.info(f"Найден системный диск: {drive_letter}")
     
     # Загружаем кусты реестра
     load_result = load_registry_hives(drive_letter)
     if not load_result['success']:
-        result['message'] = f'❌ {load_result["message"]}'
+        result['message'] = f'{load_result["message"]}'
         result['errors'].append(load_result['message'])
         return result
     

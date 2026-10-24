@@ -5,7 +5,7 @@ DedHelper - Модули
 
 from .autorun import AutorunManager, get_all_autoruns, remove_autorun
 from .restrictions import RestrictionsManager, get_restrictions, remove_all_restrictions
-from .system import SystemCommands, restart_pc, enter_winre, run_sfc, disable_test_mode
+from .system import SystemCommands, restart_pc, enter_winre, run_sfc
 from .recovery import WinREManager, get_winre_status, enable_winre, disable_winre, boot_to_winre
 from .processes import ProcessManager, get_processes, terminate_process, suspend_process, resume_process
 from .registry import RegistryEditor, read_registry, write_registry, delete_registry, open_regedit
@@ -27,7 +27,6 @@ __all__ = [
     'restart_pc',
     'enter_winre',
     'run_sfc',
-    'disable_test_mode',
 
     # Recovery
     'WinREManager',
