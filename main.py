@@ -1002,13 +1002,6 @@ class DedHelperApp:
         right = tk.Frame(header, bg=COLORS['bg_medium'])
         right.pack(side=tk.RIGHT, padx=16)
 
-        tk.Button(right, text="⚠ Все блокировки",
-                  command=self._open_virus_report,
-                  font=('Segoe UI', 9, 'bold'),
-                  bg=COLORS['critical'], fg='white',
-                  relief='flat', padx=10, pady=4,
-                  cursor='hand2', bd=0).pack(side=tk.LEFT, padx=(0, 10))
-
         status_bg = COLORS['success'] if self.is_admin else COLORS['warning']
         status_text = "  Администратор  " if self.is_admin else "  Без прав админа  "
         tk.Label(right, text=status_text, font=('Segoe UI', 9),
@@ -1034,7 +1027,6 @@ class DedHelperApp:
         cards.pack(fill=tk.X)
 
         buttons = [
-            ("SOS FakeVirus (полный откат)", self._sos_fakevirus),
             ("Восстановить шрифт", self._restore_font),
             ("Включить UAC", self._enable_uac),
             ("Войти в WinRE", self._enter_winre),
