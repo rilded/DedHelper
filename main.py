@@ -1,13 +1,15 @@
 """
 DedHelper - Утилита для восстановления Windows после вирусов
-Версия 5.1 — утилитарный дизайн + полный сканер FakeVirus:
-  * покрытие ВСЕХ ASEP вируса (v9): Run, Startup, Scheduler, IFEO multi,
-    Winlogon Userinit/Shell/ShellInfrastructure, BootExecute, BootShell,
-    SafeBoot AlternateShell, Setup CmdLine/SetupType,
-    DisableTaskMgr/CMD/RegistryTools/NoWinKeys/NoRun, UAC, file-copies
-  * индикатор блокировок в шапке + кнопка SOS FakeVirus
-  * виртуальные красные строки в Автозагрузке / Ограничениях / Планировщике
-  * периодическое сканирование каждые 5 сек
+Версия 5.2 — универсальный аудит ASEP:
+  * сканирует подозрительные Autostart Extensibility Points
+  * эвристика на основе путей, подписей и отклонений от дефолтов
+  * покрытие: Run/RunOnce, Startup, Scheduler, IFEO, Winlogon
+    (Shell/Userinit/ShellInfrastructure/AppRuntime/Taskman), BootExecute,
+    BootShell, SafeBoot AlternateShell, Setup CmdLine, Policies
+    (DisableTaskMgr/NoRun/NoWinKeys и т.д.), UAC
+  * восстановление ASEP до дефолтных значений
+  * индикатор в шапке + сводный отчёт
+  * работает в Windows и в WinPE (офлайн через OfflineSession)
 
 Требования:
 - Python 3.8+
@@ -29,7 +31,6 @@ import winreg
 import tempfile
 import logging
 import re
-import glob
 from modules.offline import OfflineSession, is_winpe
 
 CREATE_NO_WINDOW = 0x08000000
@@ -68,7 +69,6 @@ def run_hidden_powershell(ps_command: str, capture_output: bool = True,
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-
     if random_name:
         temp_dir = tempfile.mkdtemp(prefix='PS_')
         ps_exe = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'),
@@ -82,12 +82,12 @@ def run_hidden_powershell(ps_command: str, capture_output: bool = True,
             ps_copy = ps_exe
         return subprocess.run(
             [ps_copy, '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-            capture_output=capture_output, startupinfo=startupinfo,
+            capture_output=True, startupinfo=startupinfo,
             creationflags=CREATE_NO_WINDOW,
         )
     return subprocess.run(
         ['powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_command],
-        capture_output=capture_output, startupinfo=startupinfo,
+        capture_output=True, startupinfo=startupinfo,
         creationflags=CREATE_NO_WINDOW,
     )
 
@@ -95,7 +95,7 @@ def run_hidden_powershell(ps_command: str, capture_output: bool = True,
 def decode_output(stdout_bytes: bytes) -> str:
     if not stdout_bytes:
         return ""
-    for encoding in ['utf-8', 'cp1251', 'cp866']:
+    for encoding in ('utf-8', 'cp1251', 'cp866'):
         try:
             return stdout_bytes.decode(encoding)
         except UnicodeDecodeError:
@@ -118,247 +118,538 @@ from modules.registry import RegistryEditor
 
 
 # ============================================================
-# СКАНЕР FakeVirus v9
+# УНИВЕРСАЛЬНЫЙ СКАНЕР ПОДОЗРИТЕЛЬНЫХ ASEP
 # ============================================================
-VIRUS_RUN_NAMES = (
-    "Windows Defender Security Update",
-    "Windows Defender Antivirus Update",
-)
-VIRUS_BAT_PATTERNS = (
-    "Windows Defender Security Update*.bat",
-    "Windows Defender Antivirus Update*.bat",
-)
-VIRUS_TASK_PATTERNS = (
-    "Windows Defender Security Update*",
-    "Windows Defender Antivirus Update*",
-)
-VIRUS_IFEO_TARGETS = ("notepad.exe", "MRT.exe", "RuntimeBroker.exe", "svchost.exe")
-VIRUS_COPY_NAMES = (
-    "chrome.exe", "chrome_updater.exe", "GoogleUpdate.exe",
-    "MicrosoftEdgeUpdate.exe", "OneDriveStandaloneUpdater.exe",
-    "chrome_installer.exe", "GoogleCrashHandler.exe",
-)
-VIRUS_COPY_DIR_SEGMENTS = (
-    "google\\chrome\\application",
-    "start menu\\programs\\startup",
-    "microsoft\\windows\\caches",
-    "\\temp\\",
-    "\\documents\\",
-    "microsoft\\templates",
+SAFE_DIRS = [
+    os.environ.get('SystemRoot', r'C:\Windows').lower(),
+    os.environ.get('ProgramFiles', r'C:\Program Files').lower(),
+    os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)').lower(),
+    os.environ.get('ProgramW6432', '').lower(),
+    os.environ.get('ProgramData', r'C:\ProgramData').lower(),
+]
+SAFE_DIRS = [d for d in SAFE_DIRS if d]
+
+RUN_SUBKEYS = (
+    r'Software\Microsoft\Windows\CurrentVersion\Run',
+    r'Software\Microsoft\Windows\CurrentVersion\RunOnce',
 )
 
+DEFAULT_BOOTSHELL = 'bootim.exe'
+DEFAULT_ALTERNATESHELL = ('', 'cmd.exe')
+DEFAULT_WINLOGON = {
+    'Shell': 'explorer.exe',
+    'ShellInfrastructure': 'sihost.exe',
+}
+# AppRuntime/Taskman обычно пусты или не заданы — всё остальное подозрительно
+SUSPICIOUS_WINLOGON_NAMES = ('AppRuntime', 'Taskman')
 
-def _has_virus_value(v) -> bool:
-    """True если значение содержит признаки вируса."""
-    if v is None:
+
+def _extract_exe_from_cmdline(cmd) -> str:
+    """Извлечь путь к exe из строки запуска (с кавычками или без)."""
+    if not cmd:
+        return ""
+    s = str(cmd).strip()
+    s = os.path.expandvars(s)
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        if end != -1:
+            return s[1:end]
+    low = s.lower()
+    idx = low.find('.exe')
+    if idx != -1:
+        return s[:idx + 4].strip('"')
+    first = (s.split() or [""])[0]
+    return first.strip('"')
+
+
+def _looks_like_path(v: str) -> bool:
+    """Похоже ли значение на путь к файлу."""
+    if not v:
         return False
-    s = str(v).lower()
-    return ('fakevirus' in s or 'chrome' in s or
-            'googleupdate' in s or 'edgeupdate' in s or
-            'onedrive' in s)
+    s = str(v).strip().strip('"')
+    if not s:
+        return False
+    low = s.lower()
+    return ('.exe' in low or '.dll' in low or '.bat' in low or
+            '.cmd' in low or '.com' in low or '.scr' in low or
+            '\\' in s or '/' in s or s.startswith('%'))
 
 
-def _scan_reg_get(hive_name: str, subpath: str, name: str):
-    """Offline-aware чтение: hive_name = 'HKLM' | 'HKCU'. Возвращает значение или None."""
+def _path_in_safe_dirs(path: str) -> bool:
+    """Путь находится в одной из безопасных директорий."""
+    if not path:
+        return False
+    try:
+        p_low = os.path.normcase(os.path.abspath(path)).lower()
+    except Exception:
+        p_low = os.path.normcase(path).lower()
+    for d in SAFE_DIRS:
+        if p_low == d or p_low.startswith(d + os.sep):
+            return True
+    return False
+
+
+def _is_path_suspicious(path: str, require_signature: bool = False) -> bool:
+    """
+    Подозрительный ли путь:
+      - вне SAFE_DIRS — подозрительно
+      - require_signature: если в SAFE_DIRS, но не подписан Microsoft — подозрительно
+    """
+    if not path:
+        return False
+    try:
+        p_low = os.path.normcase(os.path.abspath(path)).lower()
+    except Exception:
+        p_low = os.path.normcase(path).lower()
+
+    in_safe = _path_in_safe_dirs(path)
+    if not in_safe:
+        # Если файл существует и это exe вне безопасных путей — подозрительно
+        if os.path.exists(path):
+            return True
+        # Если не существует — считаем подозрительным только если путь
+        # типично "пользовательский" (AppData / Temp / Public / Desktop)
+        markers = ('\\appdata\\', '\\temp\\', '\\users\\public\\',
+                   '\\desktop\\', '\\downloads\\', '\\documents\\',
+                   '\\startup\\')
+        return any(m in p_low for m in markers)
+
+    if require_signature:
+        if not os.path.exists(path):
+            # Не существует — странно для системного ключа
+            return True
+        try:
+            if not is_signed_by_microsoft(path):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _read_run_values(hive_name: str, subkey: str) -> dict:
+    """Прочитать все значения в Run/RunOnce. Возвращает {name: (value, type)}."""
+    result = {}
     if OfflineSession.active:
         if hive_name == 'HKLM':
             try:
-                k = OfflineSession.open_hklm(subpath, winreg.KEY_QUERY_VALUE)
+                k = OfflineSession.open_hklm(subkey, winreg.KEY_QUERY_VALUE)
+                try:
+                    n = winreg.QueryInfoKey(k)[1]
+                    for i in range(n):
+                        try:
+                            nm, v, t = winreg.EnumValue(k, i)
+                            result[nm] = (v, t)
+                        except OSError:
+                            continue
+                finally:
+                    winreg.CloseKey(k)
+            except (FileNotFoundError, OSError):
+                pass
+        else:
+            for _label, hive, prefix in OfflineSession.hkcu_roots():
+                full = f"{prefix}\\{subkey}" if prefix else subkey
+                try:
+                    k = winreg.OpenKey(hive, full, 0, winreg.KEY_QUERY_VALUE)
+                    try:
+                        n = winreg.QueryInfoKey(k)[1]
+                        for i in range(n):
+                            try:
+                                nm, v, t = winreg.EnumValue(k, i)
+                                result.setdefault(nm, (v, t))
+                            except OSError:
+                                continue
+                    finally:
+                        winreg.CloseKey(k)
+                except (FileNotFoundError, OSError):
+                    continue
+    else:
+        hive = winreg.HKEY_LOCAL_MACHINE if hive_name == 'HKLM' else winreg.HKEY_CURRENT_USER
+        try:
+            k = winreg.OpenKey(hive, subkey, 0, winreg.KEY_QUERY_VALUE)
+            try:
+                n = winreg.QueryInfoKey(k)[1]
+                for i in range(n):
+                    try:
+                        nm, v, t = winreg.EnumValue(k, i)
+                        result[nm] = (v, t)
+                    except OSError:
+                        continue
+            finally:
+                winreg.CloseKey(k)
+        except (FileNotFoundError, OSError):
+            pass
+    return result
+
+
+def _reg_get_generic(hive_name: str, subkey: str, name: str):
+    """Читает значение с учётом offline. None если нет."""
+    if OfflineSession.active:
+        if hive_name == 'HKLM':
+            try:
+                k = OfflineSession.open_hklm(subkey, winreg.KEY_QUERY_VALUE)
                 try:
                     return winreg.QueryValueEx(k, name)[0]
                 finally:
                     winreg.CloseKey(k)
             except (FileNotFoundError, OSError):
                 return None
-        # HKCU: первый непустой из всех профилей
-        for _label, hive, prefix in OfflineSession.hkcu_roots():
-            full = f"{prefix}\\{subpath}" if prefix else subpath
+        for _l, hive, prefix in OfflineSession.hkcu_roots():
+            full = f"{prefix}\\{subkey}" if prefix else subkey
             try:
                 k = winreg.OpenKey(hive, full, 0, winreg.KEY_QUERY_VALUE)
                 try:
-                    v = winreg.QueryValueEx(k, name)[0]
-                    if v is not None:
-                        return v
+                    return winreg.QueryValueEx(k, name)[0]
                 finally:
                     winreg.CloseKey(k)
             except (FileNotFoundError, OSError):
                 continue
         return None
-    else:
-        hive = (winreg.HKEY_LOCAL_MACHINE if hive_name == 'HKLM'
-                else winreg.HKEY_CURRENT_USER)
+    hive = winreg.HKEY_LOCAL_MACHINE if hive_name == 'HKLM' else winreg.HKEY_CURRENT_USER
+    try:
+        k = winreg.OpenKey(hive, subkey, 0, winreg.KEY_QUERY_VALUE)
         try:
-            k = winreg.OpenKey(hive, subpath, 0, winreg.KEY_QUERY_VALUE)
+            return winreg.QueryValueEx(k, name)[0]
+        finally:
+            winreg.CloseKey(k)
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _enum_ifeo_keys() -> list:
+    """Список всех подключей в Image File Execution Options."""
+    result = []
+    sub = r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+    if OfflineSession.active:
+        try:
+            k = OfflineSession.open_hklm(sub, winreg.KEY_QUERY_VALUE)
             try:
-                return winreg.QueryValueEx(k, name)[0]
+                n = winreg.QueryInfoKey(k)[0]
+                for i in range(n):
+                    try:
+                        result.append(winreg.EnumKey(k, i))
+                    except OSError:
+                        continue
             finally:
                 winreg.CloseKey(k)
         except (FileNotFoundError, OSError):
-            return None
+            pass
+    else:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub, 0, winreg.KEY_QUERY_VALUE)
+            try:
+                n = winreg.QueryInfoKey(k)[0]
+                for i in range(n):
+                    try:
+                        result.append(winreg.EnumKey(k, i))
+                    except OSError:
+                        continue
+            finally:
+                winreg.CloseKey(k)
+        except (FileNotFoundError, OSError):
+            pass
+    return result
 
 
-def scan_virus_blocks() -> list:
+def scan_suspicious_asep() -> list:
     """
-    Возвращает список всех блокировок/ASEP FakeVirus.
-    Каждый элемент: {'category', 'name', 'value', 'where'}.
+    Универсальный сканер подозрительных ASEP.
+    Возвращает list[{'category', 'name', 'value', 'where', 'severity', 'default'}]:
+      - severity = 'high' | 'medium'
+      - default — желаемое значение для восстановления (None = удалить значение)
     """
     items = []
 
-    def add(cat, name, value, where):
-        items.append({'category': cat, 'name': name,
-                      'value': str(value), 'where': where})
+    def add(cat, name, value, where, severity='medium', default=None):
+        items.append({
+            'category': cat, 'name': name, 'value': str(value),
+            'where': where, 'severity': severity, 'default': default,
+        })
 
-    # --- Run ---
+    # --- Run / RunOnce ---
     for hive_name, tag in (('HKCU', 'HKCU'), ('HKLM', 'HKLM')):
-        for rn in VIRUS_RUN_NAMES:
-            v = _scan_reg_get(hive_name,
-                              r'Software\Microsoft\Windows\CurrentVersion\Run', rn)
-            if v and _has_virus_value(v):
-                add('Run', rn, v,
-                    f'{tag}\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')
-        # Копии с суффиксами хеша
-        if not OfflineSession.active:
-            hive = (winreg.HKEY_LOCAL_MACHINE if hive_name == 'HKLM'
-                    else winreg.HKEY_CURRENT_USER)
-            try:
-                k = winreg.OpenKey(
-                    hive, r'Software\Microsoft\Windows\CurrentVersion\Run',
-                    0, winreg.KEY_QUERY_VALUE)
-                try:
-                    n = winreg.QueryInfoKey(k)[1]
-                    for i in range(n):
-                        try:
-                            nm, val, _ = winreg.EnumValue(k, i)
-                        except OSError:
-                            continue
-                        if any(rn in nm for rn in VIRUS_RUN_NAMES) and \
-                           _has_virus_value(val):
-                            if not any(x['name'] == nm and x['category'] == 'Run'
-                                       for x in items):
-                                add('Run', nm, val,
-                                    f'{tag}\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')
-                finally:
-                    winreg.CloseKey(k)
-            except Exception:
-                pass
+        for sub in RUN_SUBKEYS:
+            for name, (val, vtype) in _read_run_values(hive_name, sub).items():
+                if not val:
+                    continue
+                exe = _extract_exe_from_cmdline(val)
+                if not exe:
+                    continue
+                if _is_path_suspicious(exe, require_signature=False):
+                    add('Run', name, val, f'{tag}\\{sub}',
+                        severity='high', default=None)
 
-    # --- Startup ---
-    startup = os.path.join(os.environ.get('APPDATA', ''),
-                           r'Microsoft\Windows\Start Menu\Programs\Startup')
-    for pat in VIRUS_BAT_PATTERNS:
-        for f in glob.glob(os.path.join(startup, pat)):
-            add('Startup', os.path.basename(f), f, startup)
-    for cp in VIRUS_COPY_NAMES:
-        f = os.path.join(startup, cp)
-        if os.path.exists(f):
-            add('Startup', cp, f, startup)
+    # --- Startup folder ---
+    startup_dir = os.path.join(
+        os.environ.get('APPDATA', ''),
+        r'Microsoft\Windows\Start Menu\Programs\Startup')
+    if os.path.isdir(startup_dir):
+        for fn in os.listdir(startup_dir):
+            full = os.path.join(startup_dir, fn)
+            low = fn.lower()
+            # .lnk / .url / .bat / .cmd / .exe — все проверяем
+            if not any(low.endswith(e) for e in
+                       ('.lnk', '.url', '.bat', '.cmd', '.exe', '.vbs', '.js', '.ps1')):
+                continue
+            # .lnk/.url не проверим по пути напрямую — но факт наличия
+            # пользовательского ярлыка сам по себе не подозрителен.
+            # Помечаем только .exe/.bat/.cmd вне подписи (или если exe вне safe).
+            if low.endswith('.exe'):
+                if _is_path_suspicious(full, require_signature=False):
+                    add('Startup', fn, full, startup_dir,
+                        severity='high', default=None)
+            elif low.endswith(('.bat', '.cmd', '.vbs', '.js', '.ps1')):
+                add('Startup', fn, full, startup_dir,
+                    severity='medium', default=None)
+
+    # Startup (общая) — ProgramData
+    startup_common = os.path.join(
+        os.environ.get('ProgramData', ''),
+        r'Microsoft\Windows\Start Menu\Programs\StartUp')
+    if os.path.isdir(startup_common):
+        for fn in os.listdir(startup_common):
+            full = os.path.join(startup_common, fn)
+            low = fn.lower()
+            if low.endswith('.exe') and _is_path_suspicious(full, require_signature=False):
+                add('Startup', fn, full, startup_common,
+                    severity='high', default=None)
+            elif low.endswith(('.bat', '.cmd', '.vbs', '.js', '.ps1')):
+                add('Startup', fn, full, startup_common,
+                    severity='medium', default=None)
 
     # --- Scheduler ---
     try:
-        r = run_hidden_command('schtasks /Query /FO CSV /NH', capture_output=True)
+        r = run_hidden_command('schtasks /query /fo CSV /nh', capture_output=True)
         out = decode_output(r.stdout) if r.stdout else ""
         seen = set()
         for line in out.splitlines():
-            line_low = line.lower()
-            if not any(p.lower().replace('*', '') in line_low for p in VIRUS_TASK_PATTERNS):
+            line = line.strip()
+            if not line.startswith('"'):
                 continue
             parts = line.split('","')
             if not parts:
                 continue
-            task = parts[0].strip('"')
-            if task in seen:
+            task_name = parts[0].strip('"').strip()
+            if not task_name or task_name in seen:
                 continue
-            seen.add(task)
-            add('Scheduler', task, 'task exists', 'Task Scheduler')
+            seen.add(task_name)
+            # Пропускаем задачи Microsoft
+            if task_name.lower().startswith('\\microsoft\\') or \
+               task_name.lower().startswith('microsoft'):
+                continue
+            try:
+                cmd_path = _get_task_command(task_name)
+            except Exception:
+                cmd_path = ""
+            if not cmd_path:
+                continue
+            exe = _extract_exe_from_cmdline(cmd_path)
+            if not exe:
+                continue
+            if _is_path_suspicious(exe, require_signature=False):
+                add('Scheduler', task_name, cmd_path, 'Task Scheduler',
+                    severity='high', default=None)
     except Exception:
         pass
 
-    # --- IFEO ---
-    for target in VIRUS_IFEO_TARGETS:
-        p = (r'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-             fr'\Image File Execution Options\{target}')
-        v = _scan_reg_get('HKLM', p, 'Debugger')
-        if v:
-            add('IFEO', target, v, f'HKLM\\{p}')
+    # --- IFEO: любой Debugger подозрителен ---
+    for target in _enum_ifeo_keys():
+        sub = (r'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+               fr'\Image File Execution Options\{target}')
+        dbg = _reg_get_generic('HKLM', sub, 'Debugger')
+        if dbg:
+            exe = _extract_exe_from_cmdline(dbg)
+            add('IFEO', target, dbg, f'HKLM\\{sub}',
+                severity='high', default='<delete>')
+        # VerifierDlls, GlobalFlag тоже потенциально могут быть использованы
+        vd = _reg_get_generic('HKLM', sub, 'VerifierDlls')
+        if vd:
+            add('IFEO', f'{target} (VerifierDlls)', vd,
+                f'HKLM\\{sub}', severity='high', default='<delete>')
 
     # --- Winlogon ---
-    wl = r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-    for name in ('Userinit', 'Shell', 'ShellInfrastructure'):
-        v = _scan_reg_get('HKLM', wl, name)
-        if _has_virus_value(v):
-            add('Winlogon', name, v, f'HKLM\\{wl}')
+    wl_sub = r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+
+    # Shell
+    v = _reg_get_generic('HKLM', wl_sub, 'Shell')
+    if v:
+        exe = _extract_exe_from_cmdline(v)
+        if v.strip().lower() != DEFAULT_WINLOGON['Shell']:
+            if _is_path_suspicious(exe, require_signature=True):
+                add('Winlogon', 'Shell', v, f'HKLM\\{wl_sub}',
+                    severity='high', default=DEFAULT_WINLOGON['Shell'])
+
+    # Userinit — должен быть userinit.exe, [+один путь]
+    v = _reg_get_generic('HKLM', wl_sub, 'Userinit')
+    if v:
+        parts = [p.strip() for p in str(v).split(',') if p.strip()]
+        if len(parts) > 1:
+            # Несколько компонентов — подозрительно (кроме случая
+            # "...userinit.exe" — это норм)
+            extra = parts[1:]
+            for e in extra:
+                if _is_path_suspicious(e, require_signature=True):
+                    add('Winlogon', 'Userinit', v, f'HKLM\\{wl_sub}',
+                        severity='high',
+                        default=os.path.join(
+                            os.environ.get('SystemRoot', r'C:\Windows'),
+                            'system32', 'userinit.exe') + ',')
+                    break
+        elif parts and 'userinit.exe' not in parts[0].lower():
+            add('Winlogon', 'Userinit', v, f'HKLM\\{wl_sub}',
+                severity='high',
+                default=os.path.join(
+                    os.environ.get('SystemRoot', r'C:\Windows'),
+                    'system32', 'userinit.exe') + ',')
+
+    # ShellInfrastructure
+    v = _reg_get_generic('HKLM', wl_sub, 'ShellInfrastructure')
+    if v and v.strip().lower() != DEFAULT_WINLOGON['ShellInfrastructure']:
+        exe = _extract_exe_from_cmdline(v)
+        if _is_path_suspicious(exe, require_signature=True):
+            add('Winlogon', 'ShellInfrastructure', v, f'HKLM\\{wl_sub}',
+                severity='high',
+                default=DEFAULT_WINLOGON['ShellInfrastructure'])
+
+    # AppRuntime / Taskman — по умолчанию не должно быть
+    for name in SUSPICIOUS_WINLOGON_NAMES:
+        v = _reg_get_generic('HKLM', wl_sub, name)
+        if v:
+            add('Winlogon', name, v, f'HKLM\\{wl_sub}',
+                severity='high', default='<delete>')
 
     # --- Session Manager ---
-    sm = r'SYSTEM\CurrentControlSet\Control\Session Manager'
-    v = _scan_reg_get('HKLM', sm, 'BootExecute')
-    vals = v if isinstance(v, list) else ([v] if v else [])
-    for x in vals:
-        if _has_virus_value(x):
-            add('BootExecute', 'BootExecute', x, f'HKLM\\{sm}')
-    v = _scan_reg_get('HKLM', sm, 'BootShell')
-    if v and _has_virus_value(v):
-        add('BootShell', 'BootShell', v, f'HKLM\\{sm}')
+    sm_sub = r'SYSTEM\CurrentControlSet\Control\Session Manager'
+
+    be = _reg_get_generic('HKLM', sm_sub, 'BootExecute')
+    if be is not None:
+        vals = be if isinstance(be, list) else [str(be)]
+        bad = []
+        for v in vals:
+            v_low = str(v).lower().strip()
+            if not v_low:
+                continue
+            # Разрешено: "autocheck autochk *" и его вариации
+            if v_low.startswith('autocheck autochk'):
+                continue
+            bad.append(v)
+        if bad:
+            add('SessionManager', 'BootExecute',
+                ' | '.join(str(x) for x in vals), f'HKLM\\{sm_sub}',
+                severity='high', default=['autocheck autochk *'])
+
+    bs = _reg_get_generic('HKLM', sm_sub, 'BootShell')
+    if bs:
+        exe = _extract_exe_from_cmdline(bs)
+        base = os.path.basename(exe).lower() if exe else ''
+        if base != DEFAULT_BOOTSHELL:
+            add('SessionManager', 'BootShell', bs, f'HKLM\\{sm_sub}',
+                severity='high', default='<delete>')
 
     # --- SafeBoot ---
-    sb = r'SYSTEM\CurrentControlSet\Control\SafeBoot'
-    v = _scan_reg_get('HKLM', sb, 'AlternateShell')
-    if v and _has_virus_value(v):
-        add('AlternateShell', 'AlternateShell', v, f'HKLM\\{sb}')
+    sb_sub = r'SYSTEM\CurrentControlSet\Control\SafeBoot'
+    alt = _reg_get_generic('HKLM', sb_sub, 'AlternateShell')
+    if alt is not None:
+        alt_str = str(alt).strip()
+        if alt_str.lower() not in DEFAULT_ALTERNATESHELL:
+            add('SafeBoot', 'AlternateShell', alt_str, f'HKLM\\{sb_sub}',
+                severity='high', default='cmd.exe')
 
     # --- Setup ---
-    st = _scan_reg_get('HKLM', r'SYSTEM\Setup', 'SetupType')
-    cl = _scan_reg_get('HKLM', r'SYSTEM\Setup', 'CmdLine')
-    sp = _scan_reg_get('HKLM', r'SYSTEM\Setup', 'SystemSetupInProgress')
+    st = _reg_get_generic('HKLM', r'SYSTEM\Setup', 'SetupType')
+    cl = _reg_get_generic('HKLM', r'SYSTEM\Setup', 'CmdLine')
+    sp = _reg_get_generic('HKLM', r'SYSTEM\Setup', 'SystemSetupInProgress')
     if st == 2:
+        # SetupType=2 — это режим установки Windows. Обычная система = 0.
+        suspicious_cmd = bool(cl) and 'sysprep' not in str(cl).lower()
         add('Setup', 'SetupType',
-            f'SetupType=2, CmdLine={cl}, SysInProgress={sp}',
-            r'HKLM\SYSTEM\Setup')
+            f'SetupType=2, CmdLine={cl or ""}, InProgress={sp}',
+            r'HKLM\SYSTEM\Setup',
+            severity='high',
+            default={'SetupType': 0, 'SystemSetupInProgress': 0, 'CmdLine': ''})
+        if suspicious_cmd:
+            add('Setup', 'CmdLine', cl, r'HKLM\SYSTEM\Setup',
+                severity='high', default='')
 
-    # --- TaskMgr / Policies ---
-    taskmgr_checks = [
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System', 'DisableTaskMgr'),
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System', 'DisableRegistryTools'),
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System', 'DisableCMD'),
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer', 'NoWinKeys'),
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer', 'NoRun'),
-        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer', 'NoViewContextMenu'),
+    # --- Policies ---
+    policy_checks = [
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System',
+         'DisableTaskMgr'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System',
+         'DisableRegistryTools'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\System',
+         'DisableCMD'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+         'NoWinKeys'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+         'NoRun'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+         'NoViewContextMenu'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+         'NoFolderOptions'),
+        (r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer',
+         'NoControlPanel'),
     ]
-    for base, name in taskmgr_checks:
+    for base, name in policy_checks:
         for hive_name, tag in (('HKCU', 'HKCU'), ('HKLM', 'HKLM')):
-            v = _scan_reg_get(hive_name, base, name)
+            v = _reg_get_generic(hive_name, base, name)
             if v == 1:
-                add('TaskMgr', name, '1', f'{tag}\\{base}')
+                add('Policies', name, '1', f'{tag}\\{base}',
+                    severity='high', default='<delete>')
+
+    # DisallowRun (список запрещённых)
+    for hive_name, tag in (('HKCU', 'HKCU'), ('HKLM', 'HKLM')):
+        sub = r'Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\DisallowRun'
+        vals = _read_run_values(hive_name, sub)
+        if vals:
+            add('Policies', 'DisallowRun', f'{len(vals)} элементов',
+                f'{tag}\\{sub}', severity='high', default='<delete>')
 
     # --- UAC ---
-    uac = _scan_reg_get('HKLM',
-                        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
-                        'EnableLUA')
+    uac = _reg_get_generic(
+        'HKLM',
+        r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
+        'EnableLUA')
     if uac == 0:
         add('UAC', 'EnableLUA', '0',
-            r'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System')
-
-    # --- Files (копии) ---
-    copy_paths = [
-        os.path.join(os.environ.get('LOCALAPPDATA', ''),
-                     r'Google\Chrome\Application\chrome.exe'),
-        os.path.join(os.environ.get('APPDATA', ''),
-                     r'Microsoft\Windows\Start Menu\Programs\Startup\chrome_updater.exe'),
-        os.path.join(os.environ.get('PROGRAMDATA', ''),
-                     r'Microsoft\Windows\Caches\GoogleUpdate.exe'),
-        os.path.join(os.environ.get('WINDIR', r'C:\Windows'),
-                     r'Temp\MicrosoftEdgeUpdate.exe'),
-        os.path.join(os.environ.get('PUBLIC', r'C:\Users\Public'),
-                     r'Documents\OneDriveStandaloneUpdater.exe'),
-        os.path.join(os.environ.get('USERPROFILE', ''),
-                     r'AppData\Local\Temp\chrome_installer.exe'),
-        os.path.join(os.environ.get('APPDATA', ''),
-                     r'Microsoft\Templates\GoogleCrashHandler.exe'),
-    ]
-    for p in copy_paths:
-        if os.path.exists(p):
-            add('File', os.path.basename(p), p, os.path.dirname(p))
+            r'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
+            severity='high', default=1)
 
     return items
+
+
+def _get_task_command(task_name: str) -> str:
+    """Путь к exe из XML задачи."""
+    if OfflineSession.active:
+        full = os.path.join(OfflineSession.windows('System32', 'Tasks'),
+                            task_name)
+        if not os.path.isfile(full):
+            return ""
+        content = None
+        for enc in ('utf-16', 'utf-8', 'cp1251'):
+            try:
+                with open(full, 'r', encoding=enc) as f:
+                    content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+            except OSError:
+                return ""
+        if not content:
+            return ""
+    else:
+        try:
+            r = run_hidden_command(
+                f'schtasks /query /tn "{task_name}" /xml ONE',
+                capture_output=True)
+            content = decode_output(r.stdout) if r.stdout else ""
+        except Exception:
+            return ""
+        if not content:
+            return ""
+    m = re.search(r'<Command>(.*?)</Command>', content, re.DOTALL)
+    if not m:
+        return ""
+    return OfflineSession.expand_vars(m.group(1).strip())
 
 
 # === ЦВЕТОВЫЕ СХЕМЫ ===
@@ -435,23 +726,11 @@ def save_settings(settings: dict):
 
 
 def extract_target_path(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
-        return ""
-    value = os.path.expandvars(value)
-    if value.startswith('"'):
-        end = value.find('"', 1)
-        return value[1:end] if end != -1 else value[1:]
-    low = value.lower()
-    idx = low.find(".exe")
-    if idx != -1:
-        return value[:idx + 4]
-    parts = value.split()
-    return parts[0] if parts else value
+    return _extract_exe_from_cmdline(value)
 
 
 def resolve_existing_path(raw_value: str) -> str:
-    target = extract_target_path(raw_value)
+    target = _extract_exe_from_cmdline(raw_value)
     if not target:
         return ""
     if os.path.exists(target):
@@ -472,71 +751,8 @@ def relaunch_as_admin() -> bool:
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         return rc > 32
     except Exception as e:
-        logger.error(f"Не удалось перезапуститься с правами администратора: {e}")
+        logger.error(f"Не удалось перезапуститься: {e}")
         return False
-
-
-# ---------------------------------------------------------------------------
-# Утилиты для реестра
-# ---------------------------------------------------------------------------
-_HIVE_MAP = {
-    'HKEY_LOCAL_MACHINE': winreg.HKEY_LOCAL_MACHINE,
-    'HKEY_CURRENT_USER': winreg.HKEY_CURRENT_USER,
-    'HKEY_CLASSES_ROOT': winreg.HKEY_CLASSES_ROOT,
-    'HKEY_USERS': winreg.HKEY_USERS,
-    'HKEY_CURRENT_CONFIG': winreg.HKEY_CURRENT_CONFIG,
-    'HKLM': winreg.HKEY_LOCAL_MACHINE,
-    'HKCU': winreg.HKEY_CURRENT_USER,
-    'HKCR': winreg.HKEY_CLASSES_ROOT,
-    'HKU': winreg.HKEY_USERS,
-    'HKCC': winreg.HKEY_CURRENT_CONFIG,
-}
-
-
-def _split_reg_path(location: str):
-    location = (location or "").strip().strip('\\')
-    parts = location.split('\\', 1)
-    if len(parts) < 2:
-        return None, None
-    hive = _HIVE_MAP.get(parts[0].upper())
-    if hive is None:
-        return None, None
-    return hive, parts[1]
-
-
-def _write_reg_value(location: str, name: str, new_value):
-    hive, subpath = _split_reg_path(location)
-    if hive is None:
-        return False, f"Не удалось разобрать путь реестра: {location}"
-    try:
-        key = winreg.OpenKey(hive, subpath, 0, winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE)
-    except FileNotFoundError:
-        return False, f"Раздел реестра не найден: {subpath}"
-    except PermissionError:
-        return False, "Отказано в доступе (запустите от администратора)"
-    except OSError as e:
-        return False, str(e)
-    try:
-        try:
-            _old, vtype = winreg.QueryValueEx(key, name)
-        except FileNotFoundError:
-            vtype = winreg.REG_SZ
-        except OSError as e:
-            return False, str(e)
-        if vtype == winreg.REG_MULTI_SZ:
-            value = [v for v in str(new_value).split('\n') if v != '']
-        else:
-            value = str(new_value)
-        try:
-            winreg.SetValueEx(key, name, 0, vtype, value)
-            return True, ""
-        except OSError as e:
-            return False, str(e)
-    finally:
-        try:
-            winreg.CloseKey(key)
-        except OSError:
-            pass
 
 
 class DedHelperApp:
@@ -548,10 +764,10 @@ class DedHelperApp:
         apply_theme(self.settings.get('theme', 'standard'))
 
         self.status_var = tk.StringVar()
-        self.virus_status_var = tk.StringVar()
+        self.asep_status_var = tk.StringVar()
         self.is_admin = is_admin()
         self.status_var.set("Администратор" if self.is_admin else "Нет прав админа!")
-        self.virus_status_var.set("Сканирую…")
+        self.asep_status_var.set("Сканирую…")
 
         self.temp_dir = tempfile.mkdtemp(prefix='DedHelper_')
         self._ensure_explorer_cache()
@@ -587,27 +803,11 @@ class DedHelperApp:
             if is_winpe():
                 OfflineSession.start()
                 self._offline_active = OfflineSession.active
-                logger.info(f"[OFFLINE] active={self._offline_active}, "
-                            f"drive={OfflineSession.drive}, "
-                            f"hives={list(OfflineSession.hives.keys())}")
             self._offline_active = OfflineSession.active
             if self._offline_active:
-                logger.info(f"WinPE: работаем с диском {OfflineSession.drive}")
-                self.status_var.set(
-                    f"WinPE | Диск: {OfflineSession.drive} (офлайн)")
+                self.status_var.set(f"WinPE | Диск: {OfflineSession.drive} (офлайн)")
             else:
-                logger.error("WinPE: не удалось определить диск Windows")
                 self.status_var.set("WinPE | Диск не найден")
-                try:
-                    messagebox.showwarning(
-                        "Диск Windows не найден",
-                        "WinPE-режим, но диск с установленной Windows "
-                        "не обнаружен.\n\n"
-                        "Функции автозагрузки, служб, планировщика, ограничений "
-                        "будут показывать данные самого WinPE (X:).",
-                        parent=root)
-                except Exception:
-                    pass
 
         self.autorun_manager = AutorunManager()
         self.restrictions_manager = RestrictionsManager()
@@ -622,8 +822,8 @@ class DedHelperApp:
 
         self._reported_critical = set()
         self._last_critical_map = {}
-        self._virus_check_job = None
-        self._virus_blocked_cache = []
+        self._asep_cache = []
+        self._asep_check_job = None
 
         self._create_header()
         self._create_quick_actions()
@@ -637,6 +837,7 @@ class DedHelperApp:
         self.root.after(2000, self._process_watch_tick)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
         import threading, queue
         self._scan_queue = queue.Queue()
         self._scan_stop = threading.Event()
@@ -646,34 +847,282 @@ class DedHelperApp:
         self._scan_thread.start()
         self.root.after(500, self._drain_scan_queue)
 
-        # Периодический сканер блокировок FakeVirus
-        self.root.after(1500, self._virus_status_tick)
+        self.root.after(1500, self._asep_status_tick)
 
-    # ───────── периодический сканер ─────────
-    def _virus_status_tick(self):
+    # ───────── ASEP периодический скан ─────────
+    def _asep_status_tick(self):
         try:
-            items = scan_virus_blocks()
-            self._virus_blocked_cache = items
+            items = scan_suspicious_asep()
+            self._asep_cache = items
             if items:
                 cats = {}
                 for it in items:
                     cats[it['category']] = cats.get(it['category'], 0) + 1
                 summary = ", ".join(f"{k}:{v}" for k, v in sorted(cats.items()))
-                self.virus_status_var.set(
-                    f"FakeVirus: {len(items)} блокировок ({summary})")
+                self.asep_status_var.set(
+                    f"Подозрительных ASEP: {len(items)}  ({summary})")
             else:
-                self.virus_status_var.set("FakeVirus не обнаружен")
+                self.asep_status_var.set("Подозрительных ASEP не обнаружено")
         except Exception as e:
-            logger.error(f"virus_status_tick: {e}")
-            self.virus_status_var.set(f"Ошибка сканера: {e}")
+            logger.error(f"asep_status_tick: {e}")
+            self.asep_status_var.set(f"Ошибка сканера ASEP: {e}")
         try:
-            self._virus_check_job = self.root.after(5000, self._virus_status_tick)
+            self._asep_check_job = self.root.after(5000, self._asep_status_tick)
         except Exception:
             pass
 
+    def _open_asep_report(self):
+        win = tk.Toplevel(self.root)
+        win.title("Отчёт ASEP")
+        win.geometry("1160x640")
+        win.configure(bg=COLORS['bg_medium'])
+        win.attributes('-topmost', True)
 
+        top = tk.Frame(win, bg=COLORS['bg_medium'])
+        top.pack(fill=tk.X, padx=10, pady=8)
+        tk.Label(top, text="Подозрительные ASEP",
+                 font=FONT_UI_LARGE_BOLD,
+                 bg=COLORS['bg_medium'], fg=COLORS['accent']).pack(side=tk.LEFT)
 
-    # ───────── остальное (без изменений от пользователя) ─────────
+        wrap = tk.Frame(win, bg=COLORS['border'])
+        wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        tree = ttk.Treeview(wrap, columns=('cat', 'name', 'value', 'where'),
+                            show='headings', height=24)
+        for c, t, w in (('cat', 'Категория', 140), ('name', 'Имя', 260),
+                        ('value', 'Значение', 440), ('where', 'Где', 300)):
+            tree.heading(c, text=t)
+            tree.column(c, width=w)
+        vsb = ttk.Scrollbar(wrap, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
+
+        items = scan_suspicious_asep()
+        tree.tag_configure('high', background=COLORS['critical'], foreground='white')
+        tree.tag_configure('medium', background=COLORS['warning'], foreground='black')
+        for it in items:
+            tree.insert('', 'end',
+                        values=(it['category'], it['name'],
+                                it['value'], it['where']),
+                        tags=(it['severity'],))
+
+        bot = tk.Frame(win, bg=COLORS['bg_medium'])
+        bot.pack(fill=tk.X, pady=6)
+        tk.Label(bot,
+                 text=(f"Найдено подозрительных ASEP: {len(items)}" if items
+                       else "Подозрительных ASEP не обнаружено"),
+                 font=FONT_UI_LARGE_BOLD,
+                 bg=COLORS['bg_medium'],
+                 fg=COLORS['critical'] if items else COLORS['success']
+                 ).pack(side=tk.LEFT, padx=14)
+
+        btns = tk.Frame(bot, bg=COLORS['bg_medium'])
+        btns.pack(side=tk.RIGHT, padx=14)
+
+        def restore_all():
+            if not messagebox.askyesno(
+                    "Восстановить ASEP",
+                    "Все подозрительные ASEP будут возвращены к значениям "
+                    "по умолчанию (Shell=explorer.exe, AlternateShell=cmd.exe, "
+                    "UAC=1, подозрительные Run/Startup/IFEO — удалены).\n\n"
+                    "Продолжить?", parent=win):
+                return
+            n = self._restore_all_asep(items)
+            messagebox.showinfo("Готово", f"Восстановлено/удалено: {n}",
+                                parent=win)
+            win.destroy()
+            try:
+                self._asep_status_tick()
+                self._refresh_autorun()
+                self._refresh_scheduler()
+                self._scan_restrictions()
+            except Exception:
+                pass
+
+        tk.Button(btns, text="Восстановить все",
+                  command=restore_all,
+                  font=FONT_UI_BOLD, bg=COLORS['critical'], fg='white',
+                  relief='flat', padx=14, pady=6).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Обновить",
+                  command=lambda: (win.destroy(), self._open_asep_report()),
+                  font=FONT_UI_BOLD, bg=COLORS['bg_light'],
+                  fg=COLORS['text_main'], relief='flat', padx=14, pady=6
+                  ).pack(side=tk.LEFT, padx=4)
+        tk.Button(btns, text="Закрыть", command=win.destroy,
+                  font=FONT_UI_BOLD, bg=COLORS['accent'], fg='white',
+                  relief='flat', padx=14, pady=6).pack(side=tk.LEFT, padx=4)
+
+    # ───────── восстановление ASEP ─────────
+    def _reg_set_hklm(self, subkey, name, value, vtype):
+        k = OfflineSession.open_hklm(subkey, winreg.KEY_SET_VALUE)
+        try:
+            winreg.SetValueEx(k, name, 0, vtype, value)
+        finally:
+            winreg.CloseKey(k)
+
+    def _reg_del_hklm(self, subkey, name):
+        try:
+            k = OfflineSession.open_hklm(subkey, winreg.KEY_SET_VALUE)
+            try:
+                winreg.DeleteValue(k, name)
+            except FileNotFoundError:
+                pass
+            finally:
+                winreg.CloseKey(k)
+        except OSError:
+            pass
+
+    def _reg_del_hkcu(self, subkey, name):
+        if OfflineSession.active:
+            for _l, hive, prefix in OfflineSession.hkcu_roots():
+                full = f"{prefix}\\{subkey}" if prefix else subkey
+                try:
+                    k = winreg.OpenKey(hive, full, 0, winreg.KEY_SET_VALUE)
+                    try:
+                        winreg.DeleteValue(k, name)
+                    except FileNotFoundError:
+                        pass
+                    finally:
+                        winreg.CloseKey(k)
+                except OSError:
+                    pass
+        else:
+            try:
+                k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, subkey, 0,
+                                   winreg.KEY_SET_VALUE)
+                try:
+                    winreg.DeleteValue(k, name)
+                except FileNotFoundError:
+                    pass
+                finally:
+                    winreg.CloseKey(k)
+            except OSError:
+                pass
+
+    def _restore_one_asep(self, it) -> bool:
+        cat = it['category']
+        name = it['name']
+        where = it['where']
+        default = it.get('default')
+        try:
+            if cat == 'Run':
+                hive_name = 'HKCU' if where.upper().startswith('HKCU') else 'HKLM'
+                if hive_name == 'HKLM':
+                    self._reg_del_hklm(RUN_SUBKEYS[0], name)
+                    self._reg_del_hklm(RUN_SUBKEYS[1], name)
+                else:
+                    self._reg_del_hkcu(RUN_SUBKEYS[0], name)
+                    self._reg_del_hkcu(RUN_SUBKEYS[1], name)
+                return True
+
+            if cat == 'Startup':
+                p = it['value']
+                if os.path.exists(p):
+                    os.remove(p)
+                    return True
+                return False
+
+            if cat == 'Scheduler':
+                run_hidden_command(f'schtasks /Delete /TN "{name}" /F')
+                return True
+
+            if cat == 'IFEO':
+                sub = (r'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+                       fr'\Image File Execution Options\{name.split(" ")[0]}')
+                key_name = ('Debugger' if 'VerifierDlls' not in name
+                            else 'VerifierDlls')
+                self._reg_del_hklm(sub, key_name)
+                return True
+
+            if cat == 'Winlogon':
+                sub = r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+                if default == '<delete>' or default is None:
+                    self._reg_del_hklm(sub, name)
+                else:
+                    self._reg_set_hklm(sub, name, str(default), winreg.REG_SZ)
+                return True
+
+            if cat == 'SessionManager':
+                sub = r'SYSTEM\CurrentControlSet\Control\Session Manager'
+                if name == 'BootExecute':
+                    self._reg_set_hklm(sub, 'BootExecute',
+                                       ['autocheck autochk *'],
+                                       winreg.REG_MULTI_SZ)
+                elif name == 'BootShell':
+                    self._reg_del_hklm(sub, 'BootShell')
+                return True
+
+            if cat == 'SafeBoot':
+                sub = r'SYSTEM\CurrentControlSet\Control\SafeBoot'
+                self._reg_set_hklm(sub, 'AlternateShell', 'cmd.exe',
+                                   winreg.REG_SZ)
+                return True
+
+            if cat == 'Setup':
+                if name == 'SetupType':
+                    self._reg_set_hklm(r'SYSTEM\Setup', 'SetupType',
+                                       0, winreg.REG_DWORD)
+                    self._reg_set_hklm(r'SYSTEM\Setup',
+                                       'SystemSetupInProgress',
+                                       0, winreg.REG_DWORD)
+                    self._reg_set_hklm(r'SYSTEM\Setup', 'CmdLine',
+                                       '', winreg.REG_SZ)
+                elif name == 'CmdLine':
+                    self._reg_set_hklm(r'SYSTEM\Setup', 'CmdLine',
+                                       '', winreg.REG_SZ)
+                return True
+
+            if cat == 'Policies':
+                base = where.split('\\', 1)[1] if '\\' in where else ''
+                hive_name = 'HKCU' if where.upper().startswith('HKCU') else 'HKLM'
+                if name == 'DisallowRun':
+                    # Удалить весь подключ
+                    try:
+                        if hive_name == 'HKLM':
+                            k = OfflineSession.open_hklm(base, winreg.KEY_SET_VALUE)
+                            winreg.CloseKey(k)
+                            # Удалить подключ
+                            try:
+                                _k = OfflineSession.open_hklm(
+                                    base.rsplit('\\', 1)[0],
+                                    winreg.KEY_SET_VALUE)
+                                try:
+                                    winreg.DeleteKey(_k, base.rsplit('\\', 1)[1])
+                                except (FileNotFoundError, OSError):
+                                    pass
+                                finally:
+                                    winreg.CloseKey(_k)
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+                else:
+                    if hive_name == 'HKLM':
+                        self._reg_del_hklm(base, name)
+                    else:
+                        self._reg_del_hkcu(base, name)
+                return True
+
+            if cat == 'UAC':
+                self._reg_set_hklm(
+                    r'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System',
+                    'EnableLUA', 1, winreg.REG_DWORD)
+                return True
+        except Exception as e:
+            logger.error(f"_restore_one_asep({cat}/{name}): {e}")
+        return False
+
+    def _restore_all_asep(self, items=None) -> int:
+        if items is None:
+            items = scan_suspicious_asep()
+        n = 0
+        for it in items:
+            if self._restore_one_asep(it):
+                n += 1
+        logger.info(f"Восстановлено ASEP: {n}")
+        return n
+
+    # ───────── остальное без изменений от исходного v5 ─────────
     def _critical_scanner_loop(self):
         while not self._scan_stop.is_set():
             try:
@@ -776,8 +1225,7 @@ class DedHelperApp:
             for s in items)
         msg = ("ОБНАРУЖЕНЫ ПОДОЗРИТЕЛЬНЫЕ КРИТИЧЕСКИЕ ПРОЦЕССЫ\n\n"
                f"{lines}\n\n"
-               "Если это FakeVirus — нажмите «SOS FakeVirus» "
-               "в Быстром восстановлении.\n\n"
+               "Такие процессы защищают себя от завершения. Обычно это вирусы.\n\n"
                "Нейтрализовать все найденные?")
         if not messagebox.askyesno("Антивирус", msg, parent=self.root):
             return
@@ -798,7 +1246,6 @@ class DedHelperApp:
         if fail:
             text += "\n\nНе удалось:\n" + "\n".join(fail)
         messagebox.showinfo("Результат", text, parent=self.root)
-        logger.info(f"Нейтрализация: {ok}/{len(items)}")
         try:
             self._refresh_processes()
         except Exception:
@@ -811,7 +1258,7 @@ class DedHelperApp:
                 self._scan_thread.join(timeout=2.0)
         except Exception:
             pass
-        for job in (self._process_watch_job, self._virus_check_job):
+        for job in (self._process_watch_job, self._asep_check_job):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
@@ -837,7 +1284,6 @@ class DedHelperApp:
                     shutil.rmtree(self.temp_dir)
                 except Exception:
                     pass
-            logger.info("Приложение закрыто")
         except Exception as e:
             logger.error(f"Ошибка при закрытии: {e}")
         finally:
@@ -929,14 +1375,12 @@ class DedHelperApp:
         try:
             if os.path.exists(self.explorer_path):
                 self.explorer_mode = 'exe'
-                logger.info(f"Explorer--: кэш ({self.explorer_path})")
                 return
             for d in self._candidate_dirs():
                 source = os.path.join(d, 'Explorer--.exe')
                 if os.path.exists(source):
                     shutil.copy2(source, self.explorer_path)
                     self.explorer_mode = 'exe'
-                    logger.info(f"Explorer--: скопирован в кэш из {source}")
                     return
             for d in self._candidate_dirs():
                 for name in ('explorer--.py', 'Explorer--.py'):
@@ -945,7 +1389,6 @@ class DedHelperApp:
                         self.explorer_py_source = source
                         self.explorer_mode = 'py'
                         return
-            logger.warning("Explorer-- не найден")
         except Exception as e:
             logger.error(f"Ошибка извлечения Explorer--: {e}")
 
@@ -983,24 +1426,26 @@ class DedHelperApp:
         header.pack(fill=tk.X)
         header.pack_propagate(False)
 
-        # Левая часть: имя + индикатор вируса
         left = tk.Frame(header, bg=COLORS['bg_medium'])
         left.pack(side=tk.LEFT, padx=(16, 10), pady=6)
-
         tk.Label(left, text="DedHelper",
                  font=('Segoe UI Semibold', 12, 'bold'),
                  bg=COLORS['bg_medium'], fg=COLORS['text_main']
                  ).pack(anchor='w')
+        tk.Label(left, textvariable=self.asep_status_var,
+                 font=('Segoe UI', 9),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_sec']
+                 ).pack(anchor='w')
 
-        self.virus_status_label = tk.Label(
-            left, textvariable=self.virus_status_var,
-            font=('Segoe UI', 9),
-            bg=COLORS['bg_medium'], fg=COLORS['text_sec'])
-        self.virus_status_label.pack(anchor='w')
-
-        # Правая часть: кнопка "все" + статус админа
         right = tk.Frame(header, bg=COLORS['bg_medium'])
         right.pack(side=tk.RIGHT, padx=16)
+
+        tk.Button(right, text="⚠ Подозрительные ASEP",
+                  command=self._open_asep_report,
+                  font=('Segoe UI', 9, 'bold'),
+                  bg=COLORS['critical'], fg='white',
+                  relief='flat', padx=10, pady=4,
+                  cursor='hand2', bd=0).pack(side=tk.LEFT, padx=(0, 10))
 
         status_bg = COLORS['success'] if self.is_admin else COLORS['warning']
         status_text = "  Администратор  " if self.is_admin else "  Без прав админа  "
@@ -1013,7 +1458,6 @@ class DedHelperApp:
     def _create_quick_actions(self):
         wrap = tk.Frame(self.root, bg=COLORS['bg_dark'])
         wrap.pack(fill=tk.X, padx=8, pady=(8, 4))
-
         title_row = tk.Frame(wrap, bg=COLORS['bg_dark'])
         title_row.pack(fill=tk.X, pady=(0, 6))
         tk.Label(title_row, text="Быстрое восстановление",
@@ -1022,62 +1466,51 @@ class DedHelperApp:
                  ).pack(side=tk.LEFT)
         tk.Frame(title_row, bg=COLORS['border'], height=1
                  ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10, pady=6)
-
         cards = tk.Frame(wrap, bg=COLORS['bg_dark'])
         cards.pack(fill=tk.X)
-
         buttons = [
-            ("Восстановить шрифт", self._restore_font),
+            ("Восстановить ASEP", self._restore_asep_from_button),
+            ("Снять ограничения", self._remove_all_restrictions),
             ("Включить UAC", self._enable_uac),
             ("Войти в WinRE", self._enter_winre),
-            ("Снять ограничения", self._remove_all_restrictions),
             ("Очистить автозагрузку", self._clean_autorun),
             ("sfc /scannow", self._run_sfc),
+            ("Восстановить шрифт", self._restore_font),
             ("Восстановить ассоциации", self._restore_associations),
             ("Заменить Sethc/Utilman на DH", self._quick_replace_sethc_utilman_self),
         ]
         for i, (text, command) in enumerate(buttons):
             self._create_action_card(cards, text, command, i)
-
         for c in range(3):
             cards.columnconfigure(c, weight=1, uniform='card')
 
     def _create_action_card(self, parent, text, command, idx):
         row, col = idx // 3, idx % 3
-        is_sos = text.startswith("SOS")
-        card = tk.Frame(parent,
-                        bg=COLORS['card'] if not is_sos else COLORS['critical'],
+        is_accent = (idx == 0)
+        bg = COLORS['accent'] if is_accent else COLORS['card']
+        fg = 'white' if is_accent else COLORS['text_main']
+        card = tk.Frame(parent, bg=bg,
                         highlightthickness=1,
                         highlightbackground=COLORS['border'],
                         cursor='hand2')
         card.grid(row=row, column=col, padx=3, pady=3, sticky='nsew')
         label = tk.Label(card, text=text, font=FONT_UI,
-                         bg=COLORS['card'] if not is_sos else COLORS['critical'],
-                         fg=COLORS['text_main'] if not is_sos else 'white',
-                         justify='center', cursor='hand2')
+                         bg=bg, fg=fg, justify='center', cursor='hand2')
         label.pack(padx=8, pady=8, fill=tk.BOTH, expand=True)
-
-        def on_click(_e):
-            command()
-
-        card.bind('<Button-1>', on_click)
-        label.bind('<Button-1>', on_click)
+        card.bind('<Button-1>', lambda e: command())
+        label.bind('<Button-1>', lambda e: command())
 
     def _create_sections(self):
         container = tk.Frame(self.root, bg=COLORS['bg_dark'])
         container.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
-
         sidebar = tk.Frame(container, bg=COLORS['bg_medium'], width=180)
         sidebar.pack(side=tk.LEFT, fill=tk.Y)
         sidebar.pack_propagate(False)
-
         content = tk.Frame(container, bg=COLORS['bg_dark'])
         content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
-
         self._sidebar_buttons = {}
         self._section_frames = {}
         self._current_section = None
-
         sections = [
             ("Автозагрузка",        self._create_autorun_tab),
             ("Службы и драйверы",   self._create_services_tab),
@@ -1088,12 +1521,10 @@ class DedHelperApp:
             ("Проводник",           self._create_explorer_tab),
             ("Настройки",           self._create_settings_tab),
         ]
-
         for name, create_func in sections:
             frame = tk.Frame(content, bg=COLORS['bg_dark'])
             create_func(frame)
             self._section_frames[name] = frame
-
         for name, _ in sections:
             btn = tk.Button(sidebar, text=name, anchor='w',
                             bg=COLORS['bg_medium'], fg=COLORS['text_main'],
@@ -1104,7 +1535,6 @@ class DedHelperApp:
                             command=lambda n=name: self._show_section(n))
             btn.pack(fill=tk.X)
             self._sidebar_buttons[name] = btn
-
         self._show_section(sections[0][0])
 
     def _show_section(self, name):
@@ -1129,7 +1559,7 @@ class DedHelperApp:
         tk.Label(status_bar, textvariable=self.status_var, font=('Segoe UI', 9),
                  bg=COLORS['bg_light'], fg=COLORS['text_main'], padx=12
                  ).pack(side=tk.LEFT)
-        tk.Label(status_bar, text="DedHelper 5.1", font=('Segoe UI', 9),
+        tk.Label(status_bar, text="DedHelper 5.2", font=('Segoe UI', 9),
                  bg=COLORS['bg_light'], fg=COLORS['text_sec'], padx=12
                  ).pack(side=tk.RIGHT)
 
@@ -1142,6 +1572,39 @@ class DedHelperApp:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=1, pady=1)
         return tree
+
+    # ==================== ASEP: восстановление по кнопке ====================
+    def _restore_asep_from_button(self):
+        items = scan_suspicious_asep()
+        if not items:
+            messagebox.showinfo("ASEP",
+                                "Подозрительных ASEP не обнаружено.",
+                                parent=self.root)
+            return
+        if not messagebox.askyesno(
+                "Восстановить ASEP",
+                f"Найдено подозрительных ASEP: {len(items)}\n\n"
+                f"Они будут возвращены к значениям по умолчанию:\n"
+                f"  • Shell=explorer.exe\n"
+                f"  • Userinit=userinit.exe\n"
+                f"  • ShellInfrastructure=sihost.exe\n"
+                f"  • BootExecute=autocheck autochk *\n"
+                f"  • AlternateShell=cmd.exe\n"
+                f"  • SetupType=0\n"
+                f"  • UAC EnableLUA=1\n"
+                f"  • подозрительные Run/Startup/Scheduler/IFEO — удалены\n\n"
+                f"Продолжить?", parent=self.root):
+            return
+        n = self._restore_all_asep(items)
+        self._asep_status_tick()
+        try:
+            self._refresh_autorun()
+            self._refresh_scheduler()
+            self._scan_restrictions()
+        except Exception:
+            pass
+        messagebox.showinfo("Готово", f"Восстановлено/удалено: {n}",
+                            parent=self.root)
 
     # ==================== БЫСТРЫЕ КНОПКИ ====================
     def _restore_font(self):
@@ -1157,7 +1620,6 @@ class DedHelperApp:
             messagebox.showerror("Ошибка", "Не удалось включить UAC")
 
     def _enter_winre(self):
-        logger.info("Вход в WinRE")
         self.system_commands.enter_winre()
 
     def _clean_hosts(self):
@@ -1168,18 +1630,14 @@ class DedHelperApp:
 
     def _remove_all_restrictions(self):
         result = self.restrictions_manager.remove_all_restrictions()
-        # + вирусные блокировки
-        n_virus = self._remove_all_virus_blocks()
-        msg = "Результат снятия ограничений:\n\n"
+        n_asep = self._restore_all_asep()
+        msg = "Результат:\n\n"
         msg += f"ScancodeMap: {'OK' if result['scancode_map'] else 'FAIL'}\n"
         msg += f"Debuggers: {result['debuggers']} удалено\n"
         msg += f"DisallowRun: {'OK' if result['disallow_run'] else 'FAIL'}\n"
-        msg += f"Group Policy: {result['group_policy']} политик удалено\n"
-        msg += f"FakeVirus блокировок снято: {n_virus}\n"
-        try:
-            self._scan_restrictions()
-        except Exception:
-            pass
+        msg += f"Group Policy: {result['group_policy']} политик\n"
+        msg += f"Подозрительных ASEP восстановлено: {n_asep}\n"
+        self._asep_status_tick()
         messagebox.showinfo("Результат", msg)
 
     def _clean_autorun(self):
@@ -1188,74 +1646,61 @@ class DedHelperApp:
                 "Будет очищено:\n"
                 "  • Подозрительные элементы автозагрузки (реестр, папка)\n"
                 "  • Winlogon: Shell, Userinit, AppRuntime\n"
-                "  • AppInit_DLLs (список DLL)\n"
+                "  • AppInit_DLLs\n"
                 "  • Подозрительные задачи планировщика\n"
-                "  • FakeVirus ASEP (полный набор)\n\n"
+                "  • Подозрительные ASEP (общий скан)\n\n"
                 "Продолжить?", parent=self.root):
             return
-
         removed = 0
         details = []
-
         try:
             n = self.autorun_manager.clear_safe_autorun()
             if n:
                 removed += n
                 details.append(f"Автозагрузка (реестр/папка): {n}")
-        except Exception as e:
-            logger.error(f"clear_safe_autorun: {e}")
-
+        except Exception:
+            pass
         try:
             n = self._clean_winlogon_values()
             if n:
                 removed += n
                 details.append(f"Winlogon: {n}")
-        except Exception as e:
-            logger.error(f"clean_winlogon: {e}")
-
+        except Exception:
+            pass
         try:
             n = self._clean_appinit_dlls()
             if n:
                 removed += n
                 details.append(f"AppInit_DLLs: {n}")
-        except Exception as e:
-            logger.error(f"clean_appinit: {e}")
-
+        except Exception:
+            pass
         try:
             n = self._clean_suspicious_tasks()
             if n:
                 removed += n
                 details.append(f"Планировщик: {n}")
-        except Exception as e:
-            logger.error(f"clean_scheduled: {e}")
-
-        # + вирусные блокировки
+        except Exception:
+            pass
         try:
-            n = self._remove_all_virus_blocks()
+            n = self._restore_all_asep()
             if n:
                 removed += n
-                details.append(f"FakeVirus ASEP: {n}")
-        except Exception as e:
-            logger.error(f"clean_virus: {e}")
-
+                details.append(f"ASEP: {n}")
+        except Exception:
+            pass
         try:
             self._refresh_autorun()
-        except Exception:
-            pass
-        try:
             self._refresh_scheduler()
+            self._asep_status_tick()
         except Exception:
             pass
-
         if removed == 0:
             messagebox.showinfo("Готово",
-                                "Подозрительных элементов не обнаружено.",
-                                parent=self.root)
+                                "Подозрительных элементов не обнаружено.")
         else:
             messagebox.showinfo(
                 "Готово",
-                f"Удалено/исправлено элементов: {removed}\n\n" + "\n".join(details),
-                parent=self.root)
+                f"Удалено/исправлено элементов: {removed}\n\n" + "\n".join(details))
 
     def _clean_winlogon_values(self):
         count = 0
@@ -1263,8 +1708,7 @@ class DedHelperApp:
             key = OfflineSession.open_hklm(
                 r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon',
                 winreg.KEY_READ | winreg.KEY_SET_VALUE)
-        except OSError as e:
-            logger.error(f"_clean_winlogon_values open: {e}")
+        except OSError:
             return 0
         try:
             windir = OfflineSession.windows()
@@ -1274,11 +1718,8 @@ class DedHelperApp:
                 if cur.lower() != 'explorer.exe':
                     winreg.SetValueEx(key, 'Shell', 0, vtype, 'explorer.exe')
                     count += 1
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 pass
-            except OSError as e:
-                logger.error(f"Winlogon Shell: {e}")
-
             try:
                 val, vtype = winreg.QueryValueEx(key, 'Userinit')
                 cur = (val or '').strip()
@@ -1286,26 +1727,20 @@ class DedHelperApp:
                 parts = [p.strip() for p in cur.split(',')]
                 needs_fix = len(parts) > 2 or (len(parts) == 2 and parts[1])
                 if not needs_fix:
-                    first_low = (parts[0] if parts else '').lower()
-                    if 'userinit.exe' not in first_low:
+                    if 'userinit.exe' not in (parts[0] if parts else '').lower():
                         needs_fix = True
                 if needs_fix:
                     winreg.SetValueEx(key, 'Userinit', 0, vtype, expected)
                     count += 1
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 pass
-            except OSError as e:
-                logger.error(f"Winlogon Userinit: {e}")
-
             for bad in ('AppRuntime', 'Taskman'):
                 try:
                     winreg.QueryValueEx(key, bad)
                     winreg.DeleteValue(key, bad)
                     count += 1
-                except FileNotFoundError:
+                except (FileNotFoundError, OSError):
                     pass
-                except OSError as e:
-                    logger.error(f"Winlogon {bad}: {e}")
         finally:
             winreg.CloseKey(key)
         return count
@@ -1327,14 +1762,11 @@ class DedHelperApp:
                     if dlls:
                         winreg.SetValueEx(key, 'AppInit_DLLs', 0, vtype, '')
                         count += 1
-                except FileNotFoundError:
+                except (FileNotFoundError, OSError):
                     pass
-                except OSError as e:
-                    logger.error(f"AppInit_DLLs ({subpath}): {e}")
             finally:
                 winreg.CloseKey(key)
-
-        for label, hive, prefix in OfflineSession.hkcu_roots():
+        for _lbl, hive, prefix in OfflineSession.hkcu_roots():
             sub = r'Software\Microsoft\Windows NT\CurrentVersion\Windows'
             full = f"{prefix}\\{sub}" if prefix else sub
             try:
@@ -1348,67 +1780,21 @@ class DedHelperApp:
                     if dlls:
                         winreg.SetValueEx(key, 'AppInit_DLLs', 0, vtype, '')
                         count += 1
-                except FileNotFoundError:
+                except (FileNotFoundError, OSError):
                     pass
-                except OSError as e:
-                    logger.error(f"AppInit_DLLs ({label}): {e}")
             finally:
                 winreg.CloseKey(key)
         return count
 
     def _clean_suspicious_tasks(self):
-        try:
-            from modules.processes import is_system_path as _is_sys, is_signed_by_microsoft as _is_signed
-        except Exception:
-            return 0
-        try:
-            result = run_hidden_command('schtasks /query /fo CSV /nh',
-                                        capture_output=True)
-            stdout = decode_output(result.stdout) if result.stdout else ""
-        except Exception:
-            return 0
-        safe_dirs = [
-            os.environ.get('SystemRoot', r'C:\Windows').lower(),
-            os.environ.get('ProgramFiles', r'C:\Program Files').lower(),
-            os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)').lower(),
-            os.environ.get('ProgramData', r'C:\ProgramData').lower(),
-        ]
-        safe_dirs = [d for d in safe_dirs if d]
         count = 0
-        seen = set()
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line or not line.startswith('"'):
-                continue
-            parts = line.split('","')
-            if not parts:
-                continue
-            task_name = parts[0].strip('"').strip()
-            if not task_name or task_name in seen:
-                continue
-            seen.add(task_name)
-            low = task_name.lower()
-            if '\\microsoft\\' in low or low.startswith('microsoft'):
-                continue
-            try:
-                path = self._get_scheduled_task_path(task_name)
-            except Exception:
-                path = ""
-            if not path:
-                continue
-            try:
-                if _is_sys(path) and _is_signed(path):
-                    continue
-            except Exception:
-                pass
-            path_low = path.lower()
-            if any(path_low.startswith(d) for d in safe_dirs):
-                continue
-            try:
-                if self.autorun_manager.delete_scheduled_task(task_name):
-                    count += 1
-            except Exception as e:
-                logger.error(f"Не удалось удалить задачу {task_name}: {e}")
+        for it in scan_suspicious_asep():
+            if it['category'] == 'Scheduler':
+                try:
+                    if self.autorun_manager.delete_scheduled_task(it['name']):
+                        count += 1
+                except Exception:
+                    pass
         return count
 
     def _run_sfc(self):
@@ -1451,8 +1837,7 @@ class DedHelperApp:
             winreg.SetValueEx(key, '', 0, winreg.REG_SZ, '"%1" %*')
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            logger.error(f"Ошибка .exe: {e}")
+        except Exception:
             return False
 
     def _fix_bat_association(self) -> bool:
@@ -1464,8 +1849,7 @@ class DedHelperApp:
             winreg.SetValueEx(key, '', 0, winreg.REG_SZ, '"%1" %*')
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            logger.error(f"Ошибка .bat: {e}")
+        except Exception:
             return False
 
     def _fix_txt_association(self) -> bool:
@@ -1477,8 +1861,7 @@ class DedHelperApp:
             winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'NOTEPAD.EXE "%1"')
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            logger.error(f"Ошибка .txt: {e}")
+        except Exception:
             return False
 
     def _fix_lnk_association(self) -> bool:
@@ -1487,8 +1870,7 @@ class DedHelperApp:
             winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'lnkfile')
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            logger.error(f"Ошибка .lnk: {e}")
+        except Exception:
             return False
 
     def _fix_html_association(self) -> bool:
@@ -1497,19 +1879,16 @@ class DedHelperApp:
             winreg.SetValueEx(key, '', 0, winreg.REG_SZ, 'htmlfile')
             winreg.CloseKey(key)
             return True
-        except Exception as e:
-            logger.error(f"Ошибка .html: {e}")
+        except Exception:
             return False
 
     # ==================== АВТОЗАГРУЗКА + ПЛАНИРОВЩИК ====================
     def _create_autorun_tab(self, parent):
         sub = ttk.Notebook(parent)
         sub.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-
         autorun_frame = ttk.Frame(sub)
         sub.add(autorun_frame, text="  Автозагрузка  ")
         self._build_autorun_subtab(autorun_frame)
-
         scheduler_frame = ttk.Frame(sub)
         sub.add(scheduler_frame, text="  Планировщик  ")
         self._build_scheduler_subtab(scheduler_frame)
@@ -1519,8 +1898,8 @@ class DedHelperApp:
         btn_frame.pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(btn_frame, text="Обновить",
                    command=self._refresh_autorun).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text="⚠ Сканировать FakeVirus",
-                   command=self._scan_virus_autorun
+        ttk.Button(btn_frame, text="Сканировать ASEP",
+                   command=self._scan_asep_into_autorun
                    ).pack(side=tk.LEFT, padx=2)
 
         columns = ('value',)
@@ -1537,41 +1916,40 @@ class DedHelperApp:
         self._autorun_rows = {}
         self._refresh_autorun()
 
+    def _scan_asep_into_autorun(self):
+        self._refresh_autorun()
+        n = sum(1 for r in self._autorun_all_rows if r.get('_asep_block'))
+        messagebox.showinfo("ASEP",
+                            f"Подозрительных ASEP: {n}", parent=self.root)
+
     def _refresh_autorun(self):
         try:
             rows = list(self.autorun_manager.get_sorted_autorun())
         except Exception as e:
             self.status_var.set(f"Ошибка: {e}")
             rows = []
-        # + виртуальные строки от FakeVirus
         try:
-            for b in scan_virus_blocks():
-                if b['category'] in ('Winlogon', 'IFEO', 'BootExecute',
-                                      'BootShell', 'AlternateShell', 'Setup'):
+            for it in scan_suspicious_asep():
+                if it['category'] in ('Winlogon', 'IFEO',
+                                       'SessionManager', 'SafeBoot', 'Setup',
+                                       'Policies', 'UAC'):
                     rows.append({
-                        'category': f"⚠ {b['category']}",
-                        'location': b['where'],
-                        'display_location': b['where'],
-                        'name': b['name'],
-                        'value': b['value'],
+                        'category': f"⚠ {it['category']}",
+                        'location': it['where'],
+                        'display_location': it['where'],
+                        'name': it['name'],
+                        'value': it['value'],
                         'safe_to_bulk_clear': False,
-                        '_virus_block': b,
+                        '_asep_block': it,
                     })
         except Exception as e:
-            logger.error(f"refresh_autorun virus: {e}")
+            logger.error(f"refresh_autorun asep: {e}")
         self._autorun_all_rows = rows
         self._render_autorun()
-        n_v = sum(1 for r in rows if r.get('_virus_block'))
+        n_a = sum(1 for r in rows if r.get('_asep_block'))
         self.status_var.set(
             f"Автозагрузка: {len(rows)} элементов"
-            + (f" (⚠ FakeVirus: {n_v})" if n_v else ""))
-
-    def _scan_virus_autorun(self):
-        self._refresh_autorun()
-        n = sum(1 for r in self._autorun_all_rows if r.get('_virus_block'))
-        messagebox.showinfo("FakeVirus в автозагрузке",
-                            f"Найдено записей FakeVirus: {n}",
-                            parent=self.root)
+            + (f" (⚠ ASEP: {n_a})" if n_a else ""))
 
     def _render_autorun(self):
         tree = self.autorun_tree
@@ -1579,8 +1957,7 @@ class DedHelperApp:
             tree.delete(item)
         self._autorun_rows = {}
         tree.tag_configure('suspicious', foreground=COLORS['critical'])
-        tree.tag_configure('virus',
-                           background=COLORS['critical'],
+        tree.tag_configure('asep', background=COLORS['critical'],
                            foreground='white')
 
         drive_prefix = ""
@@ -1599,8 +1976,8 @@ class DedHelperApp:
                 value = row['value']
                 display = value if len(value) <= 150 else value[:147] + "..."
                 tags = ()
-                if row.get('_virus_block'):
-                    tags = ('virus',)
+                if row.get('_asep_block'):
+                    tags = ('asep',)
                 elif (row['category'] == 'Setup'
                       and row['name'].lower() == 'cmdline'
                       and value.strip()
@@ -1617,7 +1994,7 @@ class DedHelperApp:
         if not sel:
             return
         row = self._autorun_rows.get(sel[0])
-        if row and not row.get('_virus_block'):
+        if row and not row.get('_asep_block'):
             self._autorun_edit_row(row)
 
     def _on_autorun_right_click(self, event):
@@ -1629,9 +2006,9 @@ class DedHelperApp:
         row = self._autorun_rows.get(iid)
         menu = tk.Menu(self.root, tearoff=0)
         if row:
-            if row.get('_virus_block'):
+            if row.get('_asep_block'):
                 menu.add_command(
-                    label="⚠ Снять блокировку FakeVirus",
+                    label="⚠ Восстановить ASEP",
                     command=lambda: self._autorun_delete_row(iid, row))
             else:
                 menu.add_command(label="Редактировать значение",
@@ -1679,33 +2056,35 @@ class DedHelperApp:
             messagebox.showinfo("Успех", f"Значение «{row['name']}» обновлено.")
             self._refresh_autorun()
         else:
-            messagebox.showerror(
-                "Ошибка",
-                "Не удалось сохранить значение.\n"
-                "Проверьте лог (%TEMP%\\DedHelper.log).")
+            messagebox.showerror("Ошибка",
+                                 "Не удалось сохранить значение.\n"
+                                 "Проверьте лог (%TEMP%\\DedHelper.log).")
 
     def _autorun_delete_row(self, iid, row):
-        vb = row.get('_virus_block')
-        if vb:
-            ok = self._remove_virus_block(vb)
+        ab = row.get('_asep_block')
+        if ab:
+            ok = self._restore_one_asep(ab)
         else:
             ok = self._dispatch_autorun_delete(row)
         if ok:
             self._autorun_all_rows = [r for r in self._autorun_all_rows
                                        if r is not row]
             self._render_autorun()
-            self.status_var.set(f"Удалено: {row['name']}")
+            self.status_var.set(f"Восстановлено: {row['name']}")
             try:
-                self._virus_status_tick()
+                self._asep_status_tick()
             except Exception:
                 pass
         else:
-            messagebox.showerror("Ошибка", f"Не удалось удалить «{row['name']}»")
+            messagebox.showerror("Ошибка",
+                                 f"Не удалось восстановить «{row['name']}»")
 
     def _dispatch_autorun_delete(self, row) -> bool:
         category = row['category']
-        if row.get('location') in getattr(self.autorun_manager, '_autorun_location_map', {}):
-            return self.autorun_manager.remove_registry_autorun(row['name'], row['location'])
+        if row.get('location') in getattr(self.autorun_manager,
+                                          '_autorun_location_map', {}):
+            return self.autorun_manager.remove_registry_autorun(row['name'],
+                                                                row['location'])
         if category == 'Папка автозагрузки':
             if 'все пользователи' in row['location']:
                 try:
@@ -1725,14 +2104,12 @@ class DedHelperApp:
         btn_frame.pack(fill=tk.X, padx=6, pady=6)
         ttk.Button(btn_frame, text="Обновить",
                    command=self._refresh_scheduler).pack(side=tk.LEFT, padx=2)
-
         self.scheduler_tree = self._create_scrolled_tree(
             parent, columns=('Путь',), show='tree headings', height=20)
         self.scheduler_tree.heading('#0', text='Задача')
         self.scheduler_tree.heading('Путь', text='Путь')
         self.scheduler_tree.column('#0', width=320)
         self.scheduler_tree.column('Путь', width=560)
-
         self.scheduler_tree.bind('<Button-3>', self._on_scheduler_right_click)
         self.scheduler_tree.bind('<Double-Button-1>',
                                   lambda e: self._scheduler_open_location_from_sel())
@@ -1743,59 +2120,26 @@ class DedHelperApp:
             for item in self.scheduler_tree.get_children():
                 self.scheduler_tree.delete(item)
             tasks = self.autorun_manager.get_scheduled_tasks()
-            self.scheduler_tree.tag_configure('virus',
+            self.scheduler_tree.tag_configure('suspicious',
                                               background=COLORS['critical'],
                                               foreground='white')
-            n_v = 0
+            suspicious_names = {it['name'] for it in scan_suspicious_asep()
+                                if it['category'] == 'Scheduler'}
             for task in tasks:
                 name = task['name']
-                is_v = any(p.lower().replace('*', '') in name.lower()
-                           for p in VIRUS_TASK_PATTERNS)
-                if is_v:
-                    n_v += 1
-                self.scheduler_tree.insert('', 'end', iid=task['name'],
+                is_susp = name in suspicious_names
+                self.scheduler_tree.insert('', 'end', iid=name,
                                             text=name, values=('',),
-                                            tags=('virus',) if is_v else ())
+                                            tags=('suspicious',) if is_susp else ())
+            n_s = len(suspicious_names)
             self.status_var.set(
                 f"Планировщик: {len(tasks)} задач"
-                + (f" (⚠ FakeVirus: {n_v})" if n_v else ""))
+                + (f" (⚠ подозрительных: {n_s})" if n_s else ""))
         except Exception as e:
             self.status_var.set(f"Ошибка: {e}")
 
     def _get_scheduled_task_path(self, task_name):
-        if OfflineSession.active:
-            full = os.path.join(OfflineSession.windows('System32', 'Tasks'),
-                                task_name)
-            if not os.path.isfile(full):
-                return ""
-            content = None
-            for enc in ('utf-16', 'utf-8', 'cp1251'):
-                try:
-                    with open(full, 'r', encoding=enc) as f:
-                        content = f.read()
-                    break
-                except UnicodeDecodeError:
-                    continue
-                except OSError:
-                    return ""
-            if not content:
-                return ""
-        else:
-            try:
-                result = run_hidden_command(
-                    f'schtasks /query /tn "{task_name}" /xml ONE',
-                    capture_output=True)
-                content = decode_output(result.stdout) if result.stdout else ""
-            except Exception as e:
-                logger.error(f"Ошибка получения пути задачи '{task_name}': {e}")
-                return ""
-            if not content:
-                return ""
-        m = re.search(r'<Command>(.*?)</Command>', content, re.DOTALL)
-        if not m:
-            return ""
-        cmd = OfflineSession.expand_vars(m.group(1).strip())
-        return resolve_existing_path(cmd)
+        return _get_task_command(task_name)
 
     def _on_scheduler_right_click(self, event):
         tree = self.scheduler_tree
@@ -1828,8 +2172,7 @@ class DedHelperApp:
         else:
             messagebox.showwarning(
                 "Путь не определён",
-                f"Не удалось определить путь к файлу задачи «{task_name}».\n"
-                f"Возможно, это встроенная команда (не exe).")
+                f"Не удалось определить путь к файлу задачи «{task_name}».")
             self.status_var.set("Готово")
 
     def _scheduler_open_location_from_sel(self):
@@ -1852,7 +2195,7 @@ class DedHelperApp:
             self._refresh_scheduler()
         else:
             messagebox.showerror("Ошибка",
-                                 f"Не удалось выполнить действие с задачей «{task_name}»")
+                                 f"Не удалось выполнить «{action}» с «{task_name}»")
 
     # ==================== СЛУЖБЫ И ДРАЙВЕРЫ ====================
     def _create_services_tab(self, parent):
@@ -1931,7 +2274,7 @@ class DedHelperApp:
     def _create_restrictions_tab(self, parent):
         top = tk.Frame(parent, bg=COLORS['bg_medium'])
         top.pack(fill=tk.X, padx=8, pady=8)
-        tk.Label(top, text="Поиск и снятие ограничений (включая FakeVirus)",
+        tk.Label(top, text="Поиск и снятие ограничений",
                  font=FONT_UI_LARGE_BOLD,
                  bg=COLORS['bg_medium'], fg=COLORS['accent']
                  ).pack(anchor=tk.W, padx=5)
@@ -1976,11 +2319,8 @@ class DedHelperApp:
             tree.delete(item)
         self._restriction_items = {}
         total = 0
-
-        tree.tag_configure('virus',
-                           background=COLORS['critical'],
+        tree.tag_configure('asep', background=COLORS['critical'],
                            foreground='white')
-
         try:
             items = self.restrictions_manager.scan_restrictions()
         except Exception as e:
@@ -1991,20 +2331,19 @@ class DedHelperApp:
                               values=(it['category'], it['name'], it['detail']))
             self._restriction_items[iid] = {'source': 'std', 'item': it}
             total += 1
-
-        # + FakeVirus
         try:
-            for b in scan_virus_blocks():
-                iid = tree.insert('', 'end',
-                                  values=(f"⚠ {b['category']}", b['name'],
-                                          f"{b['value'][:200]}  [{b['where']}]"),
-                                  tags=('virus',))
-                self._restriction_items[iid] = {'source': 'virus', 'item': b}
-                total += 1
+            for it in scan_suspicious_asep():
+                if it['category'] in ('Policies', 'UAC', 'Setup'):
+                    iid = tree.insert(
+                        '', 'end',
+                        values=(f"⚠ {it['category']}", it['name'],
+                                f"{it['value'][:200]}  [{it['where']}]"),
+                        tags=('asep',))
+                    self._restriction_items[iid] = {'source': 'asep', 'item': it}
+                    total += 1
         except Exception as e:
-            logger.error(f"scan_restrictions virus: {e}")
-
-        self.status_var.set(f"Всего блокировок: {total}")
+            logger.error(f"scan_restrictions asep: {e}")
+        self.status_var.set(f"Всего ограничений: {total}")
 
     def _on_restriction_right_click(self, event):
         iid = self.restrictions_tree.identify_row(event.y)
@@ -2024,21 +2363,18 @@ class DedHelperApp:
             entry = self._restriction_items.get(iid)
             if not entry:
                 continue
-            if entry['source'] == 'virus':
-                if self._remove_virus_block(entry['item']):
+            if entry['source'] == 'asep':
+                if self._restore_one_asep(entry['item']):
                     ok += 1
             else:
                 if self.restrictions_manager.remove_restriction_item(entry['item']):
                     ok += 1
         self._scan_restrictions()
-        try:
-            self._virus_status_tick()
-        except Exception:
-            pass
+        self._asep_status_tick()
         messagebox.showinfo("Готово", f"Снято: {ok} из {len(selected)}")
 
     def _remove_all_found_restrictions(self):
-        n = self._remove_all_virus_blocks()
+        n = self._restore_all_asep()
         for entry in list(self._restriction_items.values()):
             if entry['source'] == 'std':
                 try:
@@ -2047,10 +2383,7 @@ class DedHelperApp:
                 except Exception:
                     pass
         self._scan_restrictions()
-        try:
-            self._virus_status_tick()
-        except Exception:
-            pass
+        self._asep_status_tick()
         messagebox.showinfo("Готово", f"Снято: {n}")
 
     def _restore_hosts(self):
@@ -2067,7 +2400,6 @@ class DedHelperApp:
                    command=self._refresh_processes).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_frame, text="Найти подозрительные критические",
                    command=self._scan_critical_now).pack(side=tk.LEFT, padx=2)
-
         self.process_tree = self._create_scrolled_tree(
             parent, columns=('PID', 'Путь'), show='tree headings', height=20)
         self.process_tree.heading('#0', text='Имя процесса')
@@ -2152,8 +2484,7 @@ class DedHelperApp:
         fallback_paths = None
         try:
             critical_map = self.process_manager.get_critical_map()
-        except Exception as e:
-            logger.error(f"get_critical_map: {e}")
+        except Exception:
             critical_map = {}
         self._last_critical_map = critical_map
         crit_count = 0
@@ -2311,7 +2642,6 @@ class DedHelperApp:
                    command=self._open_regedit).pack(side=tk.LEFT, padx=2)
         body = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-
         left_wrap = tk.Frame(body, bg=COLORS['border'])
         body.add(left_wrap, weight=1)
         left_inner = tk.Frame(left_wrap, bg=COLORS['border'])
@@ -2323,7 +2653,6 @@ class DedHelperApp:
         lvsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.reg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
                             padx=1, pady=1)
-
         right_wrap = tk.Frame(body, bg=COLORS['border'])
         body.add(right_wrap, weight=2)
         right_inner = tk.Frame(right_wrap, bg=COLORS['border'])
@@ -2700,7 +3029,8 @@ class DedHelperApp:
             else:
                 messagebox.showerror("ОШИБКА", result['message'])
             if result.get('errors'):
-                messagebox.showwarning("Предупреждения", "\n".join(result['errors']))
+                messagebox.showwarning("Предупреждения",
+                                       "\n".join(result['errors']))
             self.status_var.set("Готово")
         except ImportError:
             messagebox.showerror("Ошибка",
@@ -2714,16 +3044,14 @@ class DedHelperApp:
         if drive_letter:
             return drive_letter
         for letter in 'CDEFGHIJK':
-            test_path = f"{letter}:\\Windows\\System32\\sethc.exe"
-            if os.path.exists(test_path):
+            if os.path.exists(f"{letter}:\\Windows\\System32\\sethc.exe"):
                 return f"{letter}:"
         return None
 
     def _replace_sethc_winpe(self):
         drive_letter = self._find_windows_drive_for_winpe()
         if not drive_letter:
-            messagebox.showerror("Ошибка",
-                                 "Не удалось найти диск с Windows!")
+            messagebox.showerror("Ошибка", "Не удалось найти диск с Windows!")
             return
         sethc_path = f"{drive_letter}\\Windows\\System32\\sethc.exe"
         if not os.path.exists(sethc_path):
@@ -2738,7 +3066,7 @@ class DedHelperApp:
             if os.path.exists(sethc_path):
                 os.remove(sethc_path)
             shutil.copy2(file_path.replace('/', '\\'), sethc_path)
-            messagebox.showinfo("Успех", "sethc.exe успешно заменен!")
+            messagebox.showinfo("Успех", "sethc.exe заменён!")
         except Exception as e:
             messagebox.showerror("Ошибка",
                                  f"Не удалось заменить sethc:\n{e}")
@@ -2751,7 +3079,7 @@ class DedHelperApp:
         utilman_path = f"{drive_letter}\\Windows\\System32\\utilman.exe"
         if not os.path.exists(utilman_path):
             messagebox.showerror("Ошибка",
-                                 f"utilman.exe не найден по пути:\n{utilman_path}")
+                                 f"utilman.exe не найден:\n{utilman_path}")
             return
         file_path = filedialog.askopenfilename(
             title="Выберите файл для замены utilman.exe",
@@ -2762,7 +3090,7 @@ class DedHelperApp:
             if os.path.exists(utilman_path):
                 os.remove(utilman_path)
             shutil.copy2(file_path.replace('/', '\\'), utilman_path)
-            messagebox.showinfo("Успех", "utilman.exe успешно заменен!")
+            messagebox.showinfo("Успех", "utilman.exe заменён!")
         except Exception as e:
             messagebox.showerror("Ошибка",
                                  f"Не удалось заменить utilman:\n{e}")
@@ -2840,23 +3168,22 @@ class DedHelperApp:
         btn_frame.pack(pady=10)
         tk.Button(btn_frame, text="Explorer--",
                   command=self._launch_explorer_at_root,
-                  font=FONT_UI_BOLD,
-                  bg=COLORS['accent'], fg='white',
+                  font=FONT_UI_BOLD, bg=COLORS['accent'], fg='white',
                   activebackground=COLORS['accent_hover'],
                   activeforeground='white',
                   relief='flat', padx=20, pady=8, cursor='hand2', bd=0
                   ).pack(side=tk.LEFT, padx=8)
         tk.Button(btn_frame, text="Explorer++",
                   command=self._launch_explorer_pp,
-                  font=FONT_UI_BOLD,
-                  bg=COLORS['bg_light'], fg=COLORS['text_main'],
+                  font=FONT_UI_BOLD, bg=COLORS['bg_light'],
+                  fg=COLORS['text_main'],
                   activebackground=COLORS['accent'], activeforeground='white',
                   relief='flat', padx=20, pady=8, cursor='hand2', bd=0
                   ).pack(side=tk.LEFT, padx=8)
         tk.Button(btn_frame, text="Обычный проводник",
                   command=self._launch_windows_explorer,
-                  font=FONT_UI_BOLD,
-                  bg=COLORS['bg_light'], fg=COLORS['text_main'],
+                  font=FONT_UI_BOLD, bg=COLORS['bg_light'],
+                  fg=COLORS['text_main'],
                   activebackground=COLORS['accent'], activeforeground='white',
                   relief='flat', padx=20, pady=8, cursor='hand2', bd=0
                   ).pack(side=tk.LEFT, padx=8)
@@ -2866,8 +3193,7 @@ class DedHelperApp:
         box = tk.Frame(parent, bg=COLORS['bg_medium'],
                        highlightthickness=1, highlightbackground=COLORS['border'])
         box.pack(fill=tk.X, padx=8, pady=8)
-        tk.Label(box, text="Поведение",
-                 font=FONT_UI_LARGE_BOLD,
+        tk.Label(box, text="Поведение", font=FONT_UI_LARGE_BOLD,
                  bg=COLORS['bg_medium'], fg=COLORS['accent']
                  ).pack(anchor=tk.W, padx=12, pady=(10, 10))
         self._close_new_var = tk.BooleanVar(
@@ -2882,25 +3208,23 @@ class DedHelperApp:
                         variable=self._topmost_var,
                         command=self._on_setting_topmost_toggle
                         ).pack(anchor=tk.W, padx=12, pady=(4, 12))
-
         theme_box = tk.Frame(parent, bg=COLORS['bg_medium'],
                               highlightthickness=1, highlightbackground=COLORS['border'])
         theme_box.pack(fill=tk.X, padx=8, pady=8)
-        tk.Label(theme_box, text="Тема оформления",
-                 font=FONT_UI_LARGE_BOLD,
+        tk.Label(theme_box, text="Тема оформления", font=FONT_UI_LARGE_BOLD,
                  bg=COLORS['bg_medium'], fg=COLORS['accent']
                  ).pack(anchor=tk.W, padx=12, pady=(10, 10))
         theme_row = tk.Frame(theme_box, bg=COLORS['bg_medium'])
         theme_row.pack(anchor=tk.W, padx=12, pady=(0, 12), fill=tk.X)
         self._theme_var = tk.StringVar(value=self.settings.get('theme', 'dark'))
-        theme_names = {'standard': 'Стандартная', 'dark': 'Тёмная',
-                       'light': 'Светлая'}
-        for key, label in theme_names.items():
+        for key, label in {'standard': 'Стандартная', 'dark': 'Тёмная',
+                           'light': 'Светлая'}.items():
             ttk.Radiobutton(theme_row, text=label, value=key,
                             variable=self._theme_var,
                             command=self._on_setting_theme_change
                             ).pack(side=tk.LEFT, padx=(0, 14))
-        tk.Label(theme_box, text="Смена темы применится после перезапуска программы.",
+        tk.Label(theme_box,
+                 text="Смена темы применится после перезапуска программы.",
                  bg=COLORS['bg_medium'], fg=COLORS['text_sec'],
                  font=('Segoe UI', 9)).pack(anchor=tk.W, padx=12, pady=(0, 10))
 
@@ -2921,7 +3245,6 @@ class DedHelperApp:
         self.settings['theme'] = self._theme_var.get()
         save_settings(self.settings)
 
-    # ───────── запуск проводников ─────────
     def _launch_explorer(self, start_path: str = None):
         try:
             if not os.path.exists(self.explorer_path):
@@ -2983,8 +3306,8 @@ def main():
             messagebox.showwarning(
                 "Нет прав администратора",
                 "Программа запущена без прав администратора — часть функций "
-                "(реестр, службы, замена системных файлов) работать не будет.\n\n"
-                "Перезапустите от имени администратора для полной работы.")
+                "работать не будет.\n\n"
+                "Перезапустите от имени администратора.")
             warn_root.destroy()
         except Exception:
             pass
